@@ -14,9 +14,11 @@
 
 """E2E test for Torch KVCacheStore with TPUs."""
 
+import glob
 import os
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -255,6 +257,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
       num_blocks: int = 4,
       expected_worker_count: int = 0,
       kv_pool_group: str = "",
+      secondary_backend_configs: Any = (),
   ) -> tuple[
       kv_cache_store.KVCacheStore,
       kv_cache_manager.KVCacheManager,
@@ -288,6 +291,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
               worker_id=f"{tag}_worker_{job_name}",
               host_blocks_to_allocate=num_blocks,
               node_id=node_id,
+              secondary_backend_configs=secondary_backend_configs,
           )
         except Exception as e:
           thread_error = e
@@ -306,6 +310,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
           raiden_controller_port=controller_port,
           expected_worker_count=expected_worker_count,
           kv_pool_group=kv_pool_group,
+          secondary_backend_configs=secondary_backend_configs,
       )
       worker_thread.join(timeout=30)
       if worker_thread.is_alive():
@@ -329,6 +334,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
           store_server_ip="localhost",
           raiden_controller_port=controller_port,
           kv_pool_group=kv_pool_group,
+          secondary_backend_configs=secondary_backend_configs,
       )
       manager = kv_cache_manager.KVCacheManager(
           kv_caches=[[tpu_cache]],
@@ -341,6 +347,7 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
           worker_id=f"{tag}_worker_{job_name}",
           host_blocks_to_allocate=num_blocks,
           node_id=node_id,
+          secondary_backend_configs=secondary_backend_configs,
       )
     return store, manager, rid
 
@@ -1192,6 +1199,69 @@ class KVCacheStoreE2ETest(parameterized.TestCase):
         )
     finally:
       del manager, store
+
+  def test_secondary_storage_e2e_offload_recall(self):
+    num_blocks = 4
+    shape = (num_blocks, 128, 8, 8, 128)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+      # 1. Build BackendConfig for POSIX secondary storage
+      cfg = kv_cache_store._impl.BackendConfig()
+      cfg.type = "PosixKVCacheStoreBackend"
+      cfg.parallelism.tp_rank = 0
+      cfg.parallelism.tp_size = 1
+      cfg.set_property("root_dir", temp_dir)
+      cfg.set_property("model_name", "test_model")
+
+      # 2. Generate test cache data
+      host_data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+      tpu_cache = torch.tensor(host_data, device=self.device)
+
+      # 3. Create paired KVCacheManager and KVCacheStore with secondary backend
+      tag = f"sec_{uuid.uuid4().hex[:8]}"
+      store, manager, rid = self._create_node(
+          tag=tag,
+          job_name="job",
+          tpu_cache=tpu_cache,
+          enable_global_registry=False,
+          secondary_backend_configs=[cfg],
+      )
+
+      try:
+        # 4. Insert initial HBM blocks to KVCacheStore
+        hashes = [b"sec_hash_0", b"sec_hash_1"]
+        self._insert_hbm_blocks(store, rid, hashes, device_blocks=[0, 1])
+
+        # 5. Call store.save(...) to offload to secondary storage
+        self.assertTrue(store.save(hashes))
+        done = self._wait_for_save(store)
+        self.assertCountEqual(done, hashes)
+
+        # 6. Assert .bin files created on disk at <temp_dir>/test_model/tp1_r0/...
+        bin_files = glob.glob(
+            os.path.join(temp_dir, "test_model", "tp1_r0", "**", "*.bin"),
+            recursive=True,
+        )
+        self.assertLen(bin_files, 2)
+
+        # 7. Clear HBM buffers
+        tpu_cache.zero_()
+
+        # 8. Call store.load(...) to recall into device blocks [2, 3]
+        self.assertLen(store.lookup(hashes), 2)
+        self.assertTrue(store.load(hashes, [2, 3]))
+        self._wait_for_load(store)
+
+        try:
+          torch.tpu.synchronize()
+        except (AttributeError, RuntimeError):
+          pass
+
+        # 9. Assert retrieved values match original data
+        np.testing.assert_array_equal(tpu_cache[2].cpu().numpy(), host_data[0])
+        np.testing.assert_array_equal(tpu_cache[3].cpu().numpy(), host_data[1])
+      finally:
+        del manager, store
 
 
 if __name__ == "__main__":

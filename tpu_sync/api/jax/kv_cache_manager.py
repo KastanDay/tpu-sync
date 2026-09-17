@@ -14,7 +14,7 @@
 
 """High-performance JAX KV Cache Manager (repurposed as TransferEngine)."""
 
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from tpu_sync.frameworks.jax import _tpu_raiden_jax as _impl
 
 
@@ -40,6 +40,7 @@ class KVCacheManager:
       raiden_controller_address: Optional[str] = None,
       worker_id: Optional[str] = None,
       enable_shm: bool = False,
+      secondary_backend_configs: Optional[Sequence[Any]] = None,
   ):
     """Instantiates the TransferEngine-based KVCacheManager.
 
@@ -99,6 +100,14 @@ class KVCacheManager:
           worker_id=worker_id,
           enable_shm=enable_shm,
       )
+    if secondary_backend_configs:
+      self.initialize_secondary_backends(secondary_backend_configs)
+
+  def initialize_secondary_backends(
+      self, secondary_backend_configs: Sequence[Any]
+  ) -> None:
+    """Initializes secondary persistent storage on this worker."""
+    self._impl.initialize_secondary_backends(list(secondary_backend_configs))
 
   def get_raiden_worker_port(self) -> int:
     """Returns the gRPC server port if running, or 0."""

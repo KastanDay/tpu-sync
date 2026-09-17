@@ -75,6 +75,7 @@ class KVCacheManager:
       raiden_controller_address: Optional[str] = None,
       worker_id: Optional[str] = None,
       enable_shm: bool = False,
+      secondary_backend_configs: Optional[Sequence[Any]] = None,
   ):
     """Instantiates the TransferEngine-based KVCacheManager.
 
@@ -139,6 +140,14 @@ class KVCacheManager:
           worker_id=worker_id,
           enable_shm=enable_shm,
       )
+    if secondary_backend_configs:
+      self.initialize_secondary_backends(secondary_backend_configs)
+
+  def initialize_secondary_backends(
+      self, secondary_backend_configs: Sequence[Any]
+  ) -> None:
+    """Initializes secondary persistent storage on this worker."""
+    self._impl.initialize_secondary_backends(list(secondary_backend_configs))
 
   @classmethod
   def create_host_only_for_testing(

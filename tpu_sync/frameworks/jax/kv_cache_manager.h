@@ -152,6 +152,15 @@ class NumaAwareKVCacheManager {
 
   absl::Status UnlockBlocks(const std::vector<int>& block_ids);
 
+  void InitializeSecondaryBackends(
+      absl::Span<const kv_cache::BackendConfig> configs) {
+    for (auto& sub_manager : sub_managers_) {
+      if (sub_manager != nullptr) {
+        sub_manager->InitializeSecondaryBackends(configs);
+      }
+    }
+  }
+
   std::string DumpMetricsToString() const;
 
   absl::StatusOr<raiden::PjRtCopyFuture> H2d(
@@ -336,6 +345,11 @@ class KVCacheManager {
   }
   size_t GetHostSize(size_t layer_idx, size_t shard_idx) {
     return numa_manager_->GetHostSize(layer_idx, shard_idx);
+  }
+
+  void InitializeSecondaryBackends(
+      absl::Span<const kv_cache::BackendConfig> configs) {
+    numa_manager_->InitializeSecondaryBackends(configs);
   }
 
   int64_t NotifyForRead(const std::string& req_id, uint64_t uuid,
