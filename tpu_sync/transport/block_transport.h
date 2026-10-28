@@ -260,6 +260,10 @@ class BlockTransport final {
                                   const lib::ChunkHeader& header);
   std::shared_ptr<BlockTransportServerPushSession> GetOrCreatePushSession(
       uint64_t uuid);
+  // Erases the active push session for |uuid| from active_push_sessions_.
+  void DeletePushSession(uint64_t uuid);
+  // Erases the active pull session for |session_id| from active_pull_sessions_.
+  void DeletePullSession(uint64_t session_id);
 
   absl::StatusOr<std::vector<int>> SyncPullInternal(
       const std::vector<std::string>& peers,

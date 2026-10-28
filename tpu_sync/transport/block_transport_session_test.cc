@@ -145,14 +145,9 @@ TEST(BlockTransportServerPushSessionTest, LifecycleAndPostCompletion) {
   MockSessionDelegate delegate(/*slice_size=*/1024, /*max_blocks=*/4,
                                /*num_layers=*/2, /*num_shards=*/1);
   BlockTransportConfig config;
-  bool completed_called = false;
-  uint64_t completed_uuid = 0;
 
   auto session = std::make_shared<BlockTransportServerPushSession>(
-      /*uuid=*/42, &delegate, config, [&](uint64_t uuid) {
-        completed_called = true;
-        completed_uuid = uuid;
-      });
+      /*uuid=*/42, &delegate, config);
 
   EXPECT_THAT(session->uuid(), Eq(42u));
   EXPECT_THAT(session->kind(), Eq(BlockTransportServerSession::Kind::kPush));
@@ -164,7 +159,6 @@ TEST(BlockTransportServerPushSessionTest, LifecycleAndPostCompletion) {
       .uuid = 42, .remote_id = 0, .local_id = 0, .shard_mask = 0};
   ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post0, /*requests=*/{}));
   EXPECT_FALSE(session->IsDone());
-  EXPECT_FALSE(completed_called);
 
   // Second layer arrives:
   lib::PostMetadata post1{
@@ -172,25 +166,20 @@ TEST(BlockTransportServerPushSessionTest, LifecycleAndPostCompletion) {
   ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post1, /*requests=*/{}));
   EXPECT_TRUE(session->IsDone());
   EXPECT_THAT(session->status(), IsOk());
-  EXPECT_TRUE(completed_called);
-  EXPECT_THAT(completed_uuid, Eq(42u));
   EXPECT_THAT(delegate.layers_received(), Eq(2));
 }
 
 TEST(BlockTransportServerPushSessionTest, Cancel) {
   MockSessionDelegate delegate;
   BlockTransportConfig config;
-  bool completed_called = false;
 
   auto session = std::make_shared<BlockTransportServerPushSession>(
-      /*uuid=*/100, &delegate, config,
-      [&](uint64_t uuid) { completed_called = true; });
+      /*uuid=*/100, &delegate, config);
 
   EXPECT_FALSE(session->IsDone());
   session->Cancel();
   EXPECT_TRUE(session->IsDone());
   EXPECT_THAT(session->status(), StatusIs(absl::StatusCode::kCancelled));
-  EXPECT_TRUE(completed_called);
 }
 
 TEST(BlockTransportServerPullSessionTest, InvalidArgumentsRejected) {

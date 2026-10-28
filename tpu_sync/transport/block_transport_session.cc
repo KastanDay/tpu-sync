@@ -290,11 +290,8 @@ absl::StatusOr<IncomingPushSpec> ResolveIncomingPushSpec(
 
 BlockTransportServerPushSession::BlockTransportServerPushSession(
     uint64_t uuid, BlockTransportDelegate* delegate,
-    const BlockTransportConfig& config, OnCompletedCallback on_completed)
-    : uuid_(uuid),
-      delegate_(delegate),
-      config_(config),
-      on_completed_(std::move(on_completed)) {}
+    const BlockTransportConfig& config)
+    : uuid_(uuid), delegate_(delegate), config_(config) {}
 
 bool BlockTransportServerPushSession::IsDone() const {
   absl::MutexLock lock(mu_);
@@ -307,15 +304,10 @@ absl::Status BlockTransportServerPushSession::status() const {
 }
 
 void BlockTransportServerPushSession::Cancel() {
-  OnCompletedCallback cb;
-  {
-    absl::MutexLock lock(mu_);
-    if (done_) return;
-    done_ = true;
-    status_ = absl::CancelledError("Push session cancelled");
-    cb = std::move(on_completed_);
-  }
-  if (cb) cb(uuid_);
+  absl::MutexLock lock(mu_);
+  if (done_) return;
+  done_ = true;
+  status_ = absl::CancelledError("Push session cancelled");
 }
 
 absl::Status BlockTransportServerPushSession::StartStream(
@@ -536,8 +528,6 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
   }
 
   bool trigger_completion = false;
-  bool session_all_done = false;
-  OnCompletedCallback completion_cb;
   {
     absl::MutexLock lock(mu_);
     auto& progress = layer_progress_[l];
@@ -645,7 +635,6 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
         if (completed_pools == pool_progress_spec->expected_pools) {
           layer_progress_.clear();
           done_ = true;
-          session_all_done = true;
         }
       } else {
         bool all_layers_called = true;
@@ -660,12 +649,8 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
         if (all_layers_called) {
           layer_progress_.clear();
           done_ = true;
-          session_all_done = true;
         }
       }
-    }
-    if (session_all_done) {
-      completion_cb = std::move(on_completed_);
     }
   }
 
@@ -694,9 +679,6 @@ absl::Status BlockTransportServerPushSession::CompleteIncomingPush(
         ABSL_RETURN_IF_ERROR(delegate_->OnRecvNetworkComplete(uuid_));
       }
     }
-  }
-  if (session_all_done && completion_cb) {
-    completion_cb(uuid_);
   }
   return absl::OkStatus();
 }

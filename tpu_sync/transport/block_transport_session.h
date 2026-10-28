@@ -111,12 +111,9 @@ class BlockTransportServerSession : public BlockTransportSession {
 class BlockTransportServerPushSession final
     : public BlockTransportServerSession {
  public:
-  using OnCompletedCallback = std::function<void(uint64_t uuid)>;
-
   BlockTransportServerPushSession(uint64_t uuid,
                                   BlockTransportDelegate* delegate,
-                                  const BlockTransportConfig& config,
-                                  OnCompletedCallback on_completed = nullptr);
+                                  const BlockTransportConfig& config);
 
   ~BlockTransportServerPushSession() override = default;
 
@@ -163,7 +160,6 @@ class BlockTransportServerPushSession final
   const uint64_t uuid_;
   BlockTransportDelegate* const delegate_;
   const BlockTransportConfig config_;
-  OnCompletedCallback on_completed_;
 
   mutable absl::Mutex mu_;
   bool done_ ABSL_GUARDED_BY(mu_) = false;

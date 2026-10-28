@@ -397,6 +397,7 @@ BlockTransport::~BlockTransport() {
     for (const auto& [uuid, session] : active_push_sessions_) {
       if (session) push_sessions.push_back(session);
     }
+    active_push_sessions_.clear();
   }
   for (const auto& session : pull_sessions) {
     session->Cancel();
@@ -448,18 +449,29 @@ BlockTransport::GetOrCreatePushSession(uint64_t uuid) {
     return session;
   }
   session = std::make_shared<BlockTransportServerPushSession>(
-      uuid, block_delegate_, config_, [this](uint64_t uuid) {
-        absl::MutexLock lock(server_sessions_mu_);
-        active_push_sessions_.erase(uuid);
-      });
+      uuid, block_delegate_, config_);
   return session;
+}
+
+void BlockTransport::DeletePushSession(uint64_t uuid) {
+  absl::MutexLock lock(server_sessions_mu_);
+  active_push_sessions_.erase(uuid);
+}
+
+void BlockTransport::DeletePullSession(uint64_t session_id) {
+  absl::MutexLock lock(server_sessions_mu_);
+  active_pull_sessions_.erase(session_id);
 }
 
 absl::Status BlockTransport::HandleIncomingPush(
     int client_fd, const lib::ChunkHeader& header) {
   std::shared_ptr<BlockTransportServerPushSession> session =
       GetOrCreatePushSession(header.uuid);
-  return session->StartStream(client_fd, header);
+  absl::Status status = session->StartStream(client_fd, header);
+  if (session->IsDone()) {
+    DeletePushSession(header.uuid);
+  }
+  return status;
 }
 
 // ---------------------------------------------------------------------------
@@ -470,7 +482,11 @@ absl::Status BlockTransport::OnRecvComplete(
     absl::Span<const lib::RequestMetadata> requests) {
   std::shared_ptr<BlockTransportServerPushSession> session =
       GetOrCreatePushSession(post.uuid);
-  return session->OnPeregrinePostComplete(post, requests);
+  absl::Status status = session->OnPeregrinePostComplete(post, requests);
+  if (session->IsDone()) {
+    DeletePushSession(post.uuid);
+  }
+  return status;
 }
 
 absl::Status BlockTransport::HandleIncomingPull(
@@ -483,15 +499,13 @@ absl::Status BlockTransport::HandleIncomingPull(
     session = std::make_shared<BlockTransportServerPullSession>(
         header.uuid, block_delegate_, config_, raw_transport_.local_ips(),
         [this, session_id](uint64_t /*uuid*/) {
-          absl::MutexLock lock(server_sessions_mu_);
-          active_pull_sessions_.erase(session_id);
+          DeletePullSession(session_id);
         });
     active_pull_sessions_[session_id] = session;
   }
   absl::Status status = session->StartStream(client_fd, header);
   if (!status.ok()) {
-    absl::MutexLock lock(server_sessions_mu_);
-    active_pull_sessions_.erase(session_id);
+    DeletePullSession(session_id);
   }
   return status;
 }
