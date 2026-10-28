@@ -697,6 +697,57 @@ class DeviceNumaNodesTest(absltest.TestCase):
     finally:
       weight_synchronizer_ffi.init_weight_synchronizer = original_init
 
+  def test_start_weight_synchronizer_single_process_interleaved_hosts(self):
+    devices = np.array(
+        [_FakeDevice(process_index=0, id=i) for i in range(4)]
+    ).reshape(2, 2)
+    mesh = _FakeMesh(devices)
+
+    def _ip_words(ip):
+      packed = b"\x00" * 10 + b"\xff\xff" + socket.inet_pton(socket.AF_INET, ip)
+      return list(struct.unpack("<4i", packed))
+
+    def mock_init(*args, **kwargs):
+      del args, kwargs
+      # Interleaved in flat mesh order: [host0, host1, host0, host1]
+      return np.array(
+          [
+              _ip_words("10.0.0.1") + [1000, 2000] + _ip_words("10.0.0.1"),
+              _ip_words("10.0.0.2") + [1000, 2000] + _ip_words("10.0.0.2"),
+              _ip_words("10.0.0.1") + [1001, 2000] + _ip_words("10.0.0.1"),
+              _ip_words("10.0.0.2") + [1001, 2000] + _ip_words("10.0.0.2"),
+          ],
+          dtype=np.int32,
+      )
+
+    original_init = weight_synchronizer_ffi.init_weight_synchronizer
+    weight_synchronizer_ffi.init_weight_synchronizer = mock_init
+    try:
+      eps = weight_synchronizer_ffi.start_weight_synchronizer(
+          [jnp.zeros(1)],
+          mesh,
+          shard_idx=jnp.zeros((2, 2), dtype=np.int32),
+          slice_byte_sizes=jnp.zeros(1, dtype=np.int32),
+          num_shards=2,
+      )
+      self.assertLen(eps.hosts, 2)
+      self.assertEqual(eps.hosts[0].host_index, 0)
+      self.assertEqual(eps.hosts[0].control_address, "10.0.0.1:2000")
+      self.assertLen(eps.hosts[0].shards, 2)
+      self.assertEqual(
+          eps.hosts[0].data_addresses, ("10.0.0.1:1000", "10.0.0.1:1001")
+      )
+      self.assertEqual(eps.hosts[0].devices, (devices.flat[0], devices.flat[2]))
+      self.assertEqual(eps.hosts[1].host_index, 1)
+      self.assertEqual(eps.hosts[1].control_address, "10.0.0.2:2000")
+      self.assertLen(eps.hosts[1].shards, 2)
+      self.assertEqual(
+          eps.hosts[1].data_addresses, ("10.0.0.2:1000", "10.0.0.2:1001")
+      )
+      self.assertEqual(eps.hosts[1].devices, (devices.flat[1], devices.flat[3]))
+    finally:
+      weight_synchronizer_ffi.init_weight_synchronizer = original_init
+
 
 if __name__ == "__main__":
   absltest.main()

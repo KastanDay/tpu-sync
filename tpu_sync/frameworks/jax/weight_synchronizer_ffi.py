@@ -156,8 +156,8 @@ def start_weight_synchronizer(
         "start_weight_synchronizer does not accept pre-packed shard_idx"
     )
 
+  num_processes = len(set(int(d.process_index) for d in mesh.devices.flat))
   if num_shards is None:
-    num_processes = len(set(int(d.process_index) for d in mesh.devices.flat))
     num_shards = mesh.devices.size // num_processes
 
   host_indices_np, _ = _derive_host_slots(mesh.devices, num_shards)
@@ -231,6 +231,22 @@ def start_weight_synchronizer(
     )
     control_address = f"{ctrl_ip}:{ctrl_port}"
     by_host[host_index].append((shard_ep, control_address))
+
+  if (
+      num_processes == 1
+      and len(by_host) > 1
+      and any(
+          len({sd[1] for sd in host_data}) > 1 for host_data in by_host.values()
+      )
+  ):
+    groups = collections.defaultdict(list)
+    for host_idx in sorted(by_host.keys()):
+      for sd in by_host[host_idx]:
+        groups[sd[1]].append(sd)
+    if len(groups) == len(by_host) and all(
+        len(group) == num_shards for group in groups.values()
+    ):
+      by_host = {idx: group for idx, group in enumerate(groups.values())}
 
   hosts = []
   for host_idx in sorted(by_host.keys()):

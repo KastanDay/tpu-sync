@@ -203,6 +203,15 @@ def main(_):
         f'Sender KVCacheManager initialized in {time.perf_counter() - t0:.2f}s'
     )
 
+    print('Waiting for Receiver KVCacheManager initialization barrier...')
+    coordinator_client = coordination_helper.CoordinationClient(
+        server_address=f'localhost:{bound_grpc_port}'
+    )
+    coordinator_client.collect_replica_info(
+        device_id=0, expected_count=2, info=[0]
+    )
+    print('Receiver ready; arming read registration...')
+
     transfer_uuid = uuid.uuid4().int & 0xFFFFFFFF
     transfer_req_id = f'perf_test_{transfer_uuid}'
 
@@ -243,42 +252,7 @@ def main(_):
     if not _PEER.value:
       raise ValueError('A peer address MUST be provided')
 
-    # 2. Connect CoordinationClient to sender
-    resolved_bns_peer = get_peer_grpc_bns_path(_PEER.value)
-    print(f'Connecting to peer coordination BNS: {resolved_bns_peer}')
-    coordinator_client = coordination_helper.CoordinationClient(
-        server_address=resolved_bns_peer
-    )
-
-    max_retries = 15
-    metadata = None
-    for attempt in range(1, max_retries + 1):
-      try:
-        metadata = coordinator_client.get_metadata()
-        break
-      except Exception as e:
-        print(
-            f'Attempt {attempt}/{max_retries} waiting for sender ({e}).'
-            'Retrying in 2s...'
-        )
-        time.sleep(2)
-
-    # 3. Retrieve metadata (block_ids, endpoints, transfer_uuid)
-    if metadata is None:
-      raise RuntimeError(
-          f'Failed to coordinate with peer {_PEER.value} after {max_retries}'
-          ' attempts.'
-      )
-
-    src_block_ids = metadata.block_ids
-    remote_endpoints = metadata.endpoints
-    transfer_uuid = metadata.transfer_uuid
-    transfer_req_id = metadata.transfer_req_id
-
-    print(f'Metadata received! Block count: {len(src_block_ids)}')
-    print(f'Resolved Peer dynamic H2H endpoints: {remote_endpoints}')
-
-    # 4. Allocate empty destination tensors on TPU
+    # 2. Allocate empty destination tensors on TPU
     t0 = time.perf_counter()
     device_tensors = [
         torch.empty(cache_shape, dtype=torch.float32, device='tpu')
@@ -290,7 +264,7 @@ def main(_):
         f'{time.perf_counter() - t0:.2f}s'
     )
 
-    # 5. Initialize KVCacheManager
+    # 3. Initialize KVCacheManager
     t0 = time.perf_counter()
 
     receiver_manager = kv_cache_manager.KVCacheManager(
@@ -303,6 +277,64 @@ def main(_):
     )
 
     print(f'Receiver KVCacheManager ready in {time.perf_counter() - t0:.2f}s')
+
+    # 4. Connect CoordinationClient to sender and synchronize at barrier
+    resolved_bns_peer = get_peer_grpc_bns_path(_PEER.value)
+    print(f'Connecting to peer coordination BNS: {resolved_bns_peer}')
+    coordinator_client = coordination_helper.CoordinationClient(
+        server_address=resolved_bns_peer
+    )
+
+    max_retries = 60
+    retry_interval = 5
+    barrier_passed = False
+    for attempt in range(1, max_retries + 1):
+      try:
+        coordinator_client.collect_replica_info(
+            device_id=1, expected_count=2, info=[1]
+        )
+        barrier_passed = True
+        break
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        print(
+            f'Attempt {attempt}/{max_retries} waiting for sender barrier'
+            f' ({e}). Retrying in {retry_interval}s...'
+        )
+        time.sleep(retry_interval)
+
+    if not barrier_passed:
+      raise RuntimeError(
+          f'Failed to synchronize barrier with peer {_PEER.value} after'
+          f' {max_retries} attempts.'
+      )
+
+    # 5. Retrieve metadata (block_ids, endpoints, transfer_uuid)
+    metadata = None
+    for attempt in range(1, max_retries + 1):
+      try:
+        metadata = coordinator_client.get_metadata()
+        if metadata.endpoints:
+          break
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        print(
+            f'Attempt {attempt}/{max_retries} waiting for sender metadata'
+            f' ({e}). Retrying in 1s...'
+        )
+      time.sleep(1)
+
+    if metadata is None or not metadata.endpoints:
+      raise RuntimeError(
+          f'Failed to coordinate with peer {_PEER.value} after {max_retries}'
+          ' attempts.'
+      )
+
+    src_block_ids = metadata.block_ids
+    remote_endpoints = metadata.endpoints
+    transfer_uuid = metadata.transfer_uuid
+    transfer_req_id = metadata.transfer_req_id
+
+    print(f'Metadata received! Block count: {len(src_block_ids)}')
+    print(f'Resolved Peer dynamic H2H endpoints: {remote_endpoints}')
 
     # 6. Time the transfer (start_read -> poll_stats -> completion)
     print('Executing H2H Read E2E offloading transfer...')
