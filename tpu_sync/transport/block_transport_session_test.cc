@@ -141,9 +141,9 @@ class MockSessionDelegate : public BlockTransportDelegate {
   int layers_received_ = 0;
 };
 
-TEST(BlockTransportServerPushSessionTest, LifecycleAndStreamCompletion) {
+TEST(BlockTransportServerPushSessionTest, LifecycleAndPostCompletion) {
   MockSessionDelegate delegate(/*slice_size=*/1024, /*max_blocks=*/4,
-                               /*num_layers=*/1, /*num_shards=*/1);
+                               /*num_layers=*/2, /*num_shards=*/1);
   BlockTransportConfig config;
   bool completed_called = false;
   uint64_t completed_uuid = 0;
@@ -159,23 +159,22 @@ TEST(BlockTransportServerPushSessionTest, LifecycleAndStreamCompletion) {
   EXPECT_FALSE(session->IsDone());
   EXPECT_THAT(session->status(), IsOk());
 
-  // 2 streams expected for layer 0 (num_streams = 2).
-  // First stream arrives:
-  ABSL_EXPECT_OK(session->CompleteIncomingPush(
-      /*local_id=*/0, /*remote_id=*/0, /*num_streams=*/2,
-      /*landed_shards=*/0, /*pool_progress_spec=*/std::nullopt));
+  // First layer arrives via Peregrine post:
+  lib::PostMetadata post0{
+      .uuid = 42, .remote_id = 0, .local_id = 0, .shard_mask = 0};
+  ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post0, /*requests=*/{}));
   EXPECT_FALSE(session->IsDone());
   EXPECT_FALSE(completed_called);
 
-  // Second stream arrives:
-  ABSL_EXPECT_OK(session->CompleteIncomingPush(
-      /*local_id=*/0, /*remote_id=*/0, /*num_streams=*/2,
-      /*landed_shards=*/0, /*pool_progress_spec=*/std::nullopt));
+  // Second layer arrives:
+  lib::PostMetadata post1{
+      .uuid = 42, .remote_id = 0, .local_id = 1, .shard_mask = 0};
+  ABSL_EXPECT_OK(session->OnPeregrinePostComplete(post1, /*requests=*/{}));
   EXPECT_TRUE(session->IsDone());
   EXPECT_THAT(session->status(), IsOk());
   EXPECT_TRUE(completed_called);
   EXPECT_THAT(completed_uuid, Eq(42u));
-  EXPECT_THAT(delegate.layers_received(), Eq(1));
+  EXPECT_THAT(delegate.layers_received(), Eq(2));
 }
 
 TEST(BlockTransportServerPushSessionTest, Cancel) {

@@ -135,6 +135,7 @@ class BlockTransportServerPushSession final
       const lib::PostMetadata& post,
       absl::Span<const lib::RequestMetadata> requests);
 
+ private:
   // Accounting for stream and shard arrivals.
   absl::Status CompleteIncomingPush(
       uint32_t local_id, uint32_t remote_id, size_t num_streams,
@@ -142,7 +143,6 @@ class BlockTransportServerPushSession final
       const std::optional<PoolPushProgressSpec>& pool_progress_spec,
       bool is_peregrine = false);
 
- private:
   struct LayerProgress {
     size_t completed_chunks = 0;
     struct SenderStreams {
