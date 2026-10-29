@@ -19,8 +19,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gmock/gmock.h>
@@ -50,8 +52,10 @@ class StagingTestManager : public KVCacheManagerBase {
     buffer_holds_.resize(num_layers);
     for (size_t l = 0; l < num_layers; ++l) {
       buffer_holds_[l].holds.resize(num_shards);
-      for (size_t sh = 0; sh < num_shards; ++sh) {
-        layers_[l].shards[sh].device_size = host_blocks * slice_byte_size;
+      if (l < layers_.size()) {
+        for (size_t sh = 0; sh < num_shards; ++sh) {
+          layers_[l].shards[sh].device_size = host_blocks * slice_byte_size;
+        }
       }
     }
   }
@@ -60,8 +64,10 @@ class StagingTestManager : public KVCacheManagerBase {
   void SetDeviceBacked(size_t layer_idx, size_t physical_size) {
     buffer_holds_[layer_idx].physical_size = physical_size;
     major_dim_size_ = 1;
-    for (auto& shard : layers_[layer_idx].shards) {
-      shard.device_size = physical_size;
+    if (layer_idx < layers_.size()) {
+      for (auto& shard : layers_[layer_idx].shards) {
+        shard.device_size = physical_size;
+      }
     }
   }
 };
@@ -518,6 +524,108 @@ TEST(PoolStagingTest, PoolHostBaseAddrs) {
   TF_ASSERT_OK_AND_ASSIGN(tpu_sync::rpc::PoolHostAddrsProto addrs,
                           bounded.PoolHostBaseAddrs(/*uuid=*/1, 0));
   EXPECT_TRUE(addrs.host_base_addrs().empty());
+}
+
+class ScopedEnvVar {
+ public:
+  ScopedEnvVar(const char* name, const char* value) : name_(name) {
+    const char* prev = std::getenv(name);
+    if (prev != nullptr) {
+      prev_ = prev;
+    }
+    setenv(name, value, /*overwrite=*/1);
+  }
+
+  ~ScopedEnvVar() {
+    if (prev_.has_value()) {
+      setenv(name_, prev_->c_str(), /*overwrite=*/1);
+    } else {
+      unsetenv(name_);
+    }
+  }
+
+  ScopedEnvVar(const ScopedEnvVar&) = delete;
+  ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+
+ private:
+  const char* name_;
+  std::optional<std::string> prev_;
+};
+
+TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
+  ScopedEnvVar staging_env("TPU_RAIDEN_NUM_STAGING_LAYERS", "2");
+  constexpr int64_t kStride = 64;
+  constexpr int64_t kNumBlocks = 16;
+  constexpr size_t kNumLayers = 4;
+  StagingTestManager manager(/*num_layers=*/kNumLayers, /*num_shards=*/1,
+                             /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+
+  EXPECT_EQ(manager.num_layers(), kNumLayers);
+  EXPECT_EQ(manager.num_host_layers(), 2u);
+
+  for (size_t i = 0; i < kNumLayers; ++i) {
+    manager.SetDeviceBacked(i, kStride * kNumBlocks);
+  }
+
+  // Register 4 pools, one per storage, with bounded staging (2 leases x 2
+  // blocks = 4 slots).
+  std::vector<PoolSpec> pools;
+  pools.reserve(kNumLayers);
+  for (size_t i = 0; i < kNumLayers; ++i) {
+    pools.push_back(DensePool("pool_" + std::to_string(i), /*storage_index=*/i,
+                              /*base_offset=*/0, kStride, kNumBlocks,
+                              /*staging_blocks_per_request=*/2));
+  }
+  ABSL_ASSERT_OK(manager.RegisterPools(pools, /*staging_leases=*/2));
+
+  for (size_t i = 0; i < kNumLayers; ++i) {
+    EXPECT_EQ(manager.GetBlockArrayHostSize(i, 0),
+              static_cast<size_t>(4 * kStride));
+  }
+
+  // Setup hooks to lease host layer 1 for pool 3.
+  KVCacheManagerBase::TransferEventHooks hooks;
+  hooks.acquire_recv_staging = [](uint64_t uuid,
+                                  size_t pool_idx) -> absl::StatusOr<size_t> {
+    return pool_idx % 2;
+  };
+  hooks.lookup_send_staging = [](uint64_t uuid,
+                                 size_t pool_idx) -> absl::StatusOr<size_t> {
+    return pool_idx % 2;
+  };
+  manager.SetTransferEventHooks(std::move(hooks));
+
+  // Lease blocks 2 and 4 on storage 3 under uuid 42.
+  ABSL_ASSERT_OK(
+      manager.AcquirePoolStagingLease(42, 3, {2, 4}, absl::Milliseconds(50)));
+
+  // Register receiver plan for uuid 42.
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_uuid(42);
+  request.set_is_sender(false);
+  auto* entry = (*request.mutable_shard_push_schedules())[0].add_entries();
+  entry->set_dst_peer("127.0.0.1:1");
+  entry->set_dst_shard_idx(0);
+  entry->set_dst_block_id(4);
+  entry->set_src_block_id(1);
+  entry->set_dst_offset_bytes(0);
+  entry->set_src_offset_bytes(0);
+  entry->set_size_bytes(16);
+  ABSL_ASSERT_OK(manager.RegisterActivePlan(42, request, /*is_sender=*/false));
+
+  // For pool 3, the hook returns host slot 1 (pool 3 % 2 = 1).
+  // Destination block 4 was leased as the 2nd block (slot 1 within the lease
+  // arena).
+  std::vector<transport::BlockChunk> chunks = manager.GetBlockChunks(
+      /*layer_idx=*/3, /*shard_idx=*/0, {4}, /*total_bytes=*/16, /*uuid=*/42,
+      /*sender_node_id=*/0);
+  ASSERT_EQ(chunks.size(), 1u);
+  EXPECT_EQ(chunks[0].size, 16u);
+  uint8_t* expected_host_base = manager.GetHostPointer(/*layer_idx=*/1, 0);
+  EXPECT_EQ(chunks[0].ptr, expected_host_base + 1 * kStride);
+
+  ABSL_ASSERT_OK(manager.UnregisterActivePlan(42));
+  manager.ReleasePoolStagingLeases(42);
 }
 
 }  // namespace

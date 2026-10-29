@@ -15,6 +15,7 @@
 #include "tpu_sync/kv_cache/reshard_receive_session.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
@@ -402,7 +403,8 @@ ReshardReceiveSession::ReshardReceiveSession(
       sub_plan_index_(plan.sub_plan_index()),
       sub_plan_count_(plan.sub_plan_count()),
       deadline_(deadline),
-      start_time_(std::chrono::steady_clock::now()) {
+      start_time_(std::chrono::steady_clock::now()),
+      staging_layer_manager_(base != nullptr ? base->num_host_layers() : 0) {
   absl::MutexLock lock(mu_);
   chip_block_ids_.assign(chip_blocks.begin(), chip_blocks.end());
   for (int32_t pool_idx : plan.transfer_pool_indices()) {
@@ -461,6 +463,7 @@ absl::Status ReshardReceiveSession::AcquireStagingLeases(
 }
 
 void ReshardReceiveSession::ReleaseStagingLocked() {
+  staging_layer_manager_.ReleaseAll();
   if (staging_released_) return;
   staging_released_ = true;
   base_->ReleasePoolStagingLeases(uuid_);
@@ -477,10 +480,55 @@ void ReshardReceiveSession::FinishLocked(const absl::Status& status) {
   }
   if (draining_) return;
   draining_ = true;
+  cancelled_.store(true, std::memory_order_relaxed);
+  staging_layer_manager_.Shutdown();
   if (in_flight_ == 0 && !done_) {
     ReleaseStagingLocked();
     done_ = true;
   }
+}
+
+absl::StatusOr<size_t> ReshardReceiveSession::AcquireStagingSlot(
+    size_t pool_idx) {
+  std::chrono::steady_clock::time_point deadline;
+  {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) {
+      return absl::CancelledError(
+          absl::StrCat("Receive session ", uuid_, " is draining"));
+    }
+    ++in_flight_;
+    deadline = deadline_;
+  }
+  absl::StatusOr<size_t> slot =
+      staging_layer_manager_.Acquire(pool_idx, deadline, &cancelled_);
+  absl::MutexLock lock(mu_);
+  if (!slot.ok() && !absl::IsCancelled(slot.status())) {
+    FinishLocked(slot.status());
+  } else if (slot.ok() && (done_ || draining_)) {
+    staging_layer_manager_.Release(pool_idx);
+    slot = absl::CancelledError(
+        absl::StrCat("Receive session ", uuid_, " is draining"));
+  }
+  EndRecvOpLocked();
+  return slot;
+}
+
+absl::StatusOr<size_t> ReshardReceiveSession::LookupStagingSlot(
+    size_t pool_idx) const {
+  {
+    absl::MutexLock lock(mu_);
+    if (done_ || draining_) {
+      return absl::CancelledError(
+          absl::StrCat("Receive session ", uuid_, " is draining"));
+    }
+  }
+  std::optional<size_t> slot = staging_layer_manager_.Lookup(pool_idx);
+  if (!slot.has_value()) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("Pool ", pool_idx, " has no leased staging slot"));
+  }
+  return *slot;
 }
 
 void ReshardReceiveSession::Finish(const absl::Status& status) {
@@ -634,30 +682,61 @@ void ReshardReceiveSession::ExecuteEligiblePoolH2ds(
       // owned until the copy ends.
       absl::MutexLock lock(mu_);
       if (done_ || draining_) {
+        staging_layer_manager_.Release(pool_idx);
         EndRecvOpLocked();
         continue;
       }
     }
-    auto future_or = base_->H2dPoolBlocks(pool_idx, dst_chip_block_ids,
-                                          /*shard_idx=*/std::nullopt, uuid_);
-    if (!future_or.ok()) {
-      FinishPoolH2d(manager, pool_idx, future_or.status());
+    if (dst_chip_block_ids.empty()) {
+      // ValidateReceiverCoverage rejects groups without destination blocks,
+      // so an empty list here is a broken invariant, not a legal no-op.
+      FinishPoolH2d(manager, pool_idx,
+                    absl::InternalError(
+                        absl::StrCat("pool ", pool_idx, " of UUID ", uuid_,
+                                     " has no destination blocks to upload")));
+      staging_layer_manager_.Release(pool_idx);
       EndRecvOp();
       if (!manager.IsShuttingDown()) {
         manager.MaybeUnregisterSettledReshardRecv(uuid_, *this);
       }
       continue;
     }
-    raiden::PjRtCopyFuture future = *std::move(future_or);
+    absl::StatusOr<size_t> slot = LookupStagingSlot(pool_idx);
+    if (!slot.ok()) {
+      FinishPoolH2d(manager, pool_idx, slot.status());
+      EndRecvOp();
+      if (!manager.IsShuttingDown()) {
+        manager.MaybeUnregisterSettledReshardRecv(uuid_, *this);
+      }
+      continue;
+    }
+    const size_t host_layer_idx = *slot;
+    absl::StatusOr<raiden::PjRtCopyFuture> copy_future =
+        base_->H2dPoolBlocks(pool_idx, dst_chip_block_ids,
+                             /*shard_idx=*/std::nullopt, uuid_, host_layer_idx);
+    if (!copy_future.ok()) {
+      FinishPoolH2d(manager, pool_idx, copy_future.status());
+      staging_layer_manager_.Release(pool_idx);
+      EndRecvOp();
+      if (!manager.IsShuttingDown()) {
+        manager.MaybeUnregisterSettledReshardRecv(uuid_, *this);
+      }
+      continue;
+    }
+    raiden::PjRtCopyFuture future = *std::move(copy_future);
     {
       absl::MutexLock lock(mu_);
       h2d_futures_.push_back(future);
     }
     future.OnReady([self = shared_from_this(), &manager,
-                    pool_idx = pool_idx](auto status_or) {
-      self->FinishPoolH2d(
-          manager, pool_idx,
-          status_or.ok() ? absl::OkStatus() : status_or.status());
+                    pool_idx = pool_idx](auto copy_status) {
+      if (copy_status.ok()) {
+        self->staging_layer_manager_.Release(pool_idx);
+        self->FinishPoolH2d(manager, pool_idx, absl::OkStatus());
+      } else {
+        self->FinishPoolH2d(manager, pool_idx, copy_status.status());
+        self->staging_layer_manager_.Release(pool_idx);
+      }
       self->EndRecvOp();
       // The upload that settles the receive also retires its plan.
       if (!manager.IsShuttingDown()) {

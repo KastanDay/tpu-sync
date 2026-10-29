@@ -705,7 +705,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx = std::nullopt,
-      std::optional<uint64_t> uuid = std::nullopt);
+      std::optional<uint64_t> uuid = std::nullopt,
+      std::optional<size_t> host_layer_idx = std::nullopt);
 
   bool AcceptsPlanlessExplicitPush(uint64_t uuid) const override;
   absl::Status BeginIncomingPush(uint64_t uuid) override;
@@ -995,7 +996,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   absl::StatusOr<raiden::PjRtCopyFuture> CopyPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx, bool device_to_host,
-      std::optional<uint64_t> uuid);
+      std::optional<uint64_t> uuid,
+      std::optional<size_t> host_layer_idx = std::nullopt);
 
   // ---- Bounded pool staging ----
   // One storage's staging arena. Unbounded storages keep the full mirror and

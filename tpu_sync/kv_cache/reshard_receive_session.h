@@ -125,6 +125,14 @@ class ReshardReceiveSession
   absl::Status OnPoolReceived(KVCacheManagerWithTransfer& manager,
                               size_t pool_idx);
 
+  // Returns the host staging buffer leased to |pool_idx|, leasing one when it
+  // has none and waiting until deadline when every slot is leased.
+  absl::StatusOr<size_t> AcquireStagingSlot(size_t pool_idx);
+
+  // Returns the host staging buffer currently leased to |pool_idx|, or
+  // kFailedPrecondition if |pool_idx| holds no lease.
+  absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const;
+
  private:
   friend struct PoolReshardRecvTestPeer;
   friend struct ReshardReceiveSessionTestPeer;
@@ -198,6 +206,8 @@ class ReshardReceiveSession
   // block ids (the flat chip_block_ids list concatenates all groups).
   absl::flat_hash_map<size_t, std::vector<int64_t>> pool_dst_block_ids_
       ABSL_GUARDED_BY(mu_);
+  StagingLayerManager staging_layer_manager_;
+  std::atomic<bool> cancelled_{false};
 };
 
 }  // namespace tpu_raiden

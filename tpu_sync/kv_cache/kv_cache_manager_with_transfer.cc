@@ -461,16 +461,26 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
   hooks.acquire_recv_staging =
       [this](uint64_t uuid, size_t layer_idx) -> absl::StatusOr<size_t> {
     std::shared_ptr<TransferReceiveSession> recv_session;
+    std::shared_ptr<ReshardReceiveSession> reshard_session;
     {
       absl::MutexLock lock(mu_);
       auto it = active_recv_sessions_.find(uuid);
-      if (it == active_recv_sessions_.end()) {
-        return absl::NotFoundError(
-            absl::StrCat("Receive session ", uuid, " not found"));
+      if (it != active_recv_sessions_.end()) {
+        recv_session = it->second;
+      } else {
+        auto reshard_it = active_pool_reshard_recvs_.find(uuid);
+        if (reshard_it != active_pool_reshard_recvs_.end()) {
+          reshard_session = reshard_it->second;
+        } else {
+          return absl::NotFoundError(
+              absl::StrCat("Receive session ", uuid, " not found"));
+        }
       }
-      recv_session = it->second;
     }
-    return recv_session->AcquireStagingSlot(layer_idx);
+    if (recv_session != nullptr) {
+      return recv_session->AcquireStagingSlot(layer_idx);
+    }
+    return reshard_session->AcquireStagingSlot(layer_idx);
   };
   hooks.lookup_send_staging =
       [this](uint64_t uuid, size_t layer_idx) -> absl::StatusOr<size_t> {
