@@ -79,8 +79,7 @@ Out of scope: prefill-to-decode ("symmetric") transfer — see
 lowering (`tpu_sync/kv_cache/reshard/pool_reshard_planner.cc` and
 `tpu_sync/core/transfer_program_reshard.cc`, which compile topology geometry
 into `StartTransferRequest` plans validated by `ValidatePlan` /
-`ValidateReceiverCoverage`); `RaidenController` — see
-[../controller/read_remote.md](../controller/read_remote.md); and `weight_sync/`
+`ValidateReceiverCoverage`); `RaidenController`; and `weight_sync/`
 model-weight resharding.
 
 ### Coordinator and engine boundary (above the sessions)
@@ -125,7 +124,7 @@ the full statements and arguments are in the module docstrings.
 | Receive A1 — at-most-once `OnPoolReceived` per declared pool | `CompleteIncomingPush` fires `OnPoolReceived(l, uuid)` only when `plan_pushes == expected_chunks`, and `RecordPoolReceivedLocked` rejects undeclared or duplicate pool indices. | Discharged: `Pipeline.StreamAccountingSafe`, `Coverage.stream_count_matches`, `CoveragePipeline.step_pipe`. |
 | Receive A2 — registration before visibility | `RegisterActivePlanDirect` and `AcquireStagingLeases` in `ReshardReceiveSession::Create` succeed before insertion into `active_pool_reshard_recvs_`, rolling back both on failure. | Discharged: `PoolStaging.reachable_reserveBeforeLease_safe`, `Coordinator.no_push_before_all_armed`. |
 | Receive A3 / Send A3 — no double end and single `StartPoolPush` lock step | Each admitted push and each H2D/D2H op ends at most once; `StartPoolPush`'s two `done_ \|\| finalizing_` checks inspect only immutable plan fields in between and fold into `d2hDone`. | C++ callback and control-flow discipline. |
-| Receive A4 — fold of `RecordPool*Locked` with `ExecuteEligiblePoolH2ds` first lock | An external `Finish` between unlocking `mu_` after recording a pool and locking `mu_` in `ExecuteEligiblePoolH2ds` has the same effect as arriving before the event or right after `in_flight_ += to_launch.size()`. | Soundness argument in `Receive.lean` (`trace_cancel_between_batch_queue_and_issue`). |
+| Receive A4 — fold of `RecordPool*Locked` with `ExecuteEligiblePoolH2ds` first lock | An external `Finish` between unlocking `mu_` after recording a pool and locking `mu_` in `ExecuteEligiblePoolH2ds` produces the same state as `cancel` arriving before the event, whereas one arriving after `in_flight_ += to_launch.size()` is `cancel` after the event. | Soundness argument in `Receive.lean` (`trace_cancel_between_batch_queue_and_issue`). |
 | Send A1 — non-empty schedule with positive peer counts per active pool | `ReshardSendSession::Create` rejects `remaining_pool_peer_pushes <= 0`, and `ExecutePush` skips pools with zero scheduled entries on this sender, matching `CountPoolReshardSendSlots`. | Discharged: `Coverage.senderStreams_pos_iff`, `Send.validPools`. |
 | Send A2 — `ExecutePush` starts before external `Finish` | `PoolReshardPush` inserts the session into `active_pool_reshard_sends_` and immediately invokes `ExecutePush`, which takes its caller op (`++in_flight_`). | C++ init discipline (`KVCacheManagerWithTransfer::PoolReshardPush`). |
 | Send A4 — per-transfer connection-release window in `EndOp` | Under `DataConnectionReuse::kPerTransfer`, the last op (`in_flight_ == 1 && finalizing_`) drops `mu_` in `EndOp` to call `ReleaseDataConnectionsAfterSend` before `--in_flight_` and `SettleLocked()`; nothing modelled changes in the window. | Soundness argument in `Send.lean`. |

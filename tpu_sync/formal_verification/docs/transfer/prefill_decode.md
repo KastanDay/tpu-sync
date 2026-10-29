@@ -80,8 +80,7 @@ registration (`NotifyForRead` / `register_read`), consumer pull and load
 
 Out of scope: pool resharding (`ReshardSendSession` / `ReshardReceiveSession`,
 `active_pool_reshard_{sends,recvs}_` in the same poll loop) — see
-[reshard.md](reshard.md); `RaidenController` — see
-[../controller/read_remote.md](../controller/read_remote.md); and
+[reshard.md](reshard.md); `RaidenController`; and
 `kv_cache_store` / `host_offload_backend`.
 
 ### Engine boundary (above `poll_stats()`)

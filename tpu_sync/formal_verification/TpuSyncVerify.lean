@@ -20,8 +20,6 @@ import TpuSyncVerify.Transfer.Reshard.Coverage
 import TpuSyncVerify.Transfer.Reshard.PoolStaging
 import TpuSyncVerify.Transfer.Reshard.Registry
 import TpuSyncVerify.Transfer.Reshard.Coordinator
--- The Controller model lands in a follow-up change and is imported here when
--- it arrives.
 
 /-!
 # TpuSyncVerify
@@ -33,5 +31,4 @@ modelled, the directory layout, and how the C++ is cited.
 * `Common` — transition-system core, list lemmas, bounded model checker.
 * `Transfer` — `Session` (settle protocol shared by every transfer session),
   `PrefillDecode/`, `Reshard/`.
-* `Controller` — `ReadRemote`.
 -/
