@@ -19,7 +19,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <optional>
 #include <string>
 #include <utility>
@@ -45,10 +44,13 @@ using ::absl_testing::StatusIs;
 class StagingTestManager : public KVCacheManagerBase {
  public:
   StagingTestManager(size_t num_layers, size_t num_shards,
-                     size_t slice_byte_size, int host_blocks)
+                     size_t slice_byte_size, int host_blocks,
+                     std::optional<int> num_staging_layers = std::nullopt)
       : KVCacheManagerBase(num_layers, num_shards, slice_byte_size,
                            /*local_port=*/std::nullopt,
-                           std::make_optional(host_blocks)) {
+                           std::make_optional(host_blocks), /*parallelism=*/1,
+                           /*host_allocator=*/nullptr, /*bind_ip=*/std::nullopt,
+                           num_staging_layers) {
     buffer_holds_.resize(num_layers);
     for (size_t l = 0; l < num_layers; ++l) {
       buffer_holds_[l].holds.resize(num_shards);
@@ -526,39 +528,13 @@ TEST(PoolStagingTest, PoolHostBaseAddrs) {
   EXPECT_TRUE(addrs.host_base_addrs().empty());
 }
 
-class ScopedEnvVar {
- public:
-  ScopedEnvVar(const char* name, const char* value) : name_(name) {
-    const char* prev = std::getenv(name);
-    if (prev != nullptr) {
-      prev_ = prev;
-    }
-    setenv(name, value, /*overwrite=*/1);
-  }
-
-  ~ScopedEnvVar() {
-    if (prev_.has_value()) {
-      setenv(name_, prev_->c_str(), /*overwrite=*/1);
-    } else {
-      unsetenv(name_);
-    }
-  }
-
-  ScopedEnvVar(const ScopedEnvVar&) = delete;
-  ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
-
- private:
-  const char* name_;
-  std::optional<std::string> prev_;
-};
-
 TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
-  ScopedEnvVar staging_env("TPU_RAIDEN_NUM_STAGING_LAYERS", "2");
   constexpr int64_t kStride = 64;
   constexpr int64_t kNumBlocks = 16;
   constexpr size_t kNumLayers = 4;
   StagingTestManager manager(/*num_layers=*/kNumLayers, /*num_shards=*/1,
-                             /*slice_byte_size=*/kStride, /*host_blocks=*/1);
+                             /*slice_byte_size=*/kStride, /*host_blocks=*/1,
+                             /*num_staging_layers=*/2);
 
   EXPECT_EQ(manager.num_layers(), kNumLayers);
   EXPECT_EQ(manager.num_host_layers(), 2u);

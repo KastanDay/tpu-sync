@@ -20,7 +20,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <future>
@@ -79,11 +78,13 @@ constexpr double kTimeoutS = 0.05;
 // A producer whose device-to-host copies complete when the test says so.
 class TestManager : public KVCacheManagerWithTransfer {
  public:
-  explicit TestManager(size_t num_layers, double timeout_s = kTimeoutS)
-      : KVCacheManagerWithTransfer(std::make_unique<TestBase>(num_layers, this),
-                                   /*node_id=*/0,
-                                   /*local_control_port=*/-1, /*max_blocks=*/1,
-                                   /*num_slots=*/kSlots, timeout_s) {}
+  explicit TestManager(size_t num_layers, double timeout_s = kTimeoutS,
+                       std::optional<int> num_staging_layers = std::nullopt)
+      : KVCacheManagerWithTransfer(
+            std::make_unique<TestBase>(num_layers, num_staging_layers, this),
+            /*node_id=*/0,
+            /*local_control_port=*/-1, /*max_blocks=*/1,
+            /*num_slots=*/kSlots, timeout_s) {}
 
   // Serves a pull for `uuid` the way ProcessPullStream does once the
   // consumer is acknowledged: the push runs on this thread and returns
@@ -243,12 +244,15 @@ class TestManager : public KVCacheManagerWithTransfer {
  private:
   class TestBase : public kv_cache::KVCacheManagerBase {
    public:
-    TestBase(size_t num_layers, TestManager* owner)
+    TestBase(size_t num_layers, std::optional<int> num_staging_layers,
+             TestManager* owner)
         : kv_cache::KVCacheManagerBase(num_layers, /*num_shards=*/1,
                                        std::vector<size_t>(num_layers, 128),
                                        /*local_port=*/std::nullopt,
                                        /*host_blocks_to_allocate=*/kSlots,
-                                       /*parallelism=*/1, nullptr),
+                                       /*parallelism=*/1, nullptr,
+                                       /*bind_ip=*/std::nullopt,
+                                       num_staging_layers),
           owner_(owner) {}
 
     absl::StatusOr<raiden::PjRtCopyFuture> D2hSyncDispatch(
@@ -317,11 +321,13 @@ class TestManager : public KVCacheManagerWithTransfer {
 // A consumer whose host-to-device copies complete when the test says so.
 class RecvTestManager : public KVCacheManagerWithTransfer {
  public:
-  explicit RecvTestManager(size_t num_layers, double timeout_s = 5.0)
-      : KVCacheManagerWithTransfer(std::make_unique<RecvBase>(num_layers, this),
-                                   /*node_id=*/0,
-                                   /*local_control_port=*/-1, /*max_blocks=*/1,
-                                   /*num_slots=*/kSlots, timeout_s) {}
+  explicit RecvTestManager(size_t num_layers, double timeout_s = 5.0,
+                           std::optional<int> num_staging_layers = std::nullopt)
+      : KVCacheManagerWithTransfer(
+            std::make_unique<RecvBase>(num_layers, num_staging_layers, this),
+            /*node_id=*/0,
+            /*local_control_port=*/-1, /*max_blocks=*/1,
+            /*num_slots=*/kSlots, timeout_s) {}
 
   void AddRecv(const std::string& req_id, uint64_t uuid,
                int32_t blocks_per_layer = 1,
@@ -418,12 +424,15 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
  private:
   class RecvBase : public kv_cache::KVCacheManagerBase {
    public:
-    RecvBase(size_t num_layers, RecvTestManager* owner)
+    RecvBase(size_t num_layers, std::optional<int> num_staging_layers,
+             RecvTestManager* owner)
         : kv_cache::KVCacheManagerBase(num_layers, /*num_shards=*/1,
                                        std::vector<size_t>(num_layers, 128),
                                        /*local_port=*/std::nullopt,
                                        /*host_blocks_to_allocate=*/kSlots,
-                                       /*parallelism=*/1, nullptr),
+                                       /*parallelism=*/1, nullptr,
+                                       /*bind_ip=*/std::nullopt,
+                                       num_staging_layers),
           owner_(owner) {}
 
     absl::StatusOr<raiden::PjRtCopyFuture> H2dSyncDispatch(
@@ -456,20 +465,6 @@ class RecvTestManager : public KVCacheManagerWithTransfer {
   std::atomic<bool> block_dispatch_{false};
   absl::Notification dispatch_entered_;
   absl::Notification release_dispatch_;
-};
-
-// Sets environment variable |name| to |value| until destroyed. The staging
-// geometry is read once when a manager is constructed, so the guard only has
-// to outlive construction.
-class ScopedEnv {
- public:
-  ScopedEnv(const char* name, const char* value) : name_(name) {
-    setenv(name, value, /*overwrite=*/1);
-  }
-  ~ScopedEnv() { unsetenv(name_); }
-
- private:
-  const char* name_;
 };
 
 class DispatchReleaseGuard {
@@ -1278,9 +1273,9 @@ TEST(RecvLifecycleTest,
   EXPECT_EQ(receiver.base()->GetBlockHostPointer(0, 0, 3)[0], 0x3C);
 }
 
-// StagingLayerManager: TPU_RAIDEN_NUM_STAGING_LAYERS=4 leaves four host layer
-// buffers for a 64-layer cache. Layers lease them in arrival order, a fifth
-// layer waits for a release, and a released buffer goes to the waiting layer
+// StagingLayerManager: num_staging_layers=4 leaves four host layer buffers
+// for a 64-layer cache. Layers lease them in arrival order, a fifth layer
+// waits for a release, and a released buffer goes to the waiting layer
 // whichever layer freed it.
 TEST(RecvLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
   constexpr size_t kNumLayers = 64;
@@ -1289,8 +1284,7 @@ TEST(RecvLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
       RecvTestManager(kNumLayers).base()->GetAllocatedHostDramBytes();
   ASSERT_GT(full_dram_bytes, 0);
 
-  ScopedEnv staging_layers("TPU_RAIDEN_NUM_STAGING_LAYERS", "4");
-  RecvTestManager consumer(kNumLayers, /*timeout_s=*/10.0);
+  RecvTestManager consumer(kNumLayers, /*timeout_s=*/10.0, kNumStagingLayers);
   kv_cache::KVCacheManagerBase* base = consumer.base();
   EXPECT_EQ(base->num_host_layers(), kNumStagingLayers);
   EXPECT_EQ(base->GetAllocatedHostDramBytes(),
@@ -1373,8 +1367,7 @@ TEST(RecvLifecycleTest,
      StagingLayerManagerReleasesAllResourcesAcrossFailureModes) {
   constexpr size_t kNumLayers = 16;
   constexpr size_t kNumStagingLayers = 4;
-  ScopedEnv staging_layers("TPU_RAIDEN_NUM_STAGING_LAYERS", "4");
-  RecvTestManager consumer(kNumLayers, /*timeout_s=*/10.0);
+  RecvTestManager consumer(kNumLayers, /*timeout_s=*/10.0, kNumStagingLayers);
   kv_cache::KVCacheManagerBase* base = consumer.base();
   const size_t block_bytes = base->block_bytes(0);
 
@@ -1479,9 +1472,9 @@ TEST(RecvLifecycleTest,
   EXPECT_FALSE(consumer.has_recv(203));
 }
 
-// Sender-side StagingLayerManager: with TPU_RAIDEN_NUM_STAGING_LAYERS=4 on a
-// 64-layer cache, StartPush leases the four host layer buffers for layers 0..3
-// and waits before issuing layer 4's D2H copy. Completing a layer's H2H push
+// Sender-side StagingLayerManager: with num_staging_layers=4 on a 64-layer
+// cache, StartPush leases the four host layer buffers for layers 0..3 and
+// waits before issuing layer 4's D2H copy. Completing a layer's H2H push
 // returns its host layer buffer to the manager so the next waiting layer can
 // D2H into it and H2H out of it.
 TEST(SendLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
@@ -1491,8 +1484,7 @@ TEST(SendLifecycleTest, StagingLayerManagerCyclesHostLayerBuffers) {
       TestManager(kNumLayers).base()->GetAllocatedHostDramBytes();
   ASSERT_GT(full_dram_bytes, 0);
 
-  ScopedEnv staging_layers("TPU_RAIDEN_NUM_STAGING_LAYERS", "4");
-  TestManager producer(kNumLayers, /*timeout_s=*/10.0);
+  TestManager producer(kNumLayers, /*timeout_s=*/10.0, kNumStagingLayers);
   producer.SetManualH2h(true);
   kv_cache::KVCacheManagerBase* base = producer.base();
   EXPECT_EQ(base->num_host_layers(), kNumStagingLayers);
@@ -1588,8 +1580,7 @@ TEST(SendLifecycleTest,
      StagingLayerManagerReleasesAllResourcesAcrossFailureModes) {
   constexpr size_t kNumLayers = 16;
   constexpr size_t kNumStagingLayers = 4;
-  ScopedEnv staging_layers("TPU_RAIDEN_NUM_STAGING_LAYERS", "4");
-  TestManager producer(kNumLayers, /*timeout_s=*/10.0);
+  TestManager producer(kNumLayers, /*timeout_s=*/10.0, kNumStagingLayers);
   producer.SetManualH2h(true);
   kv_cache::KVCacheManagerBase* base = producer.base();
   const size_t block_bytes = base->block_bytes(0);

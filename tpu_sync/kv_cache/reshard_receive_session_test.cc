@@ -16,7 +16,6 @@
 
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstdint>
-#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -59,32 +58,6 @@ using ::absl_testing::StatusIs;
 using ::tpu_sync::rpc::MEMORY_TYPE_HBM;
 using ::tpu_sync::rpc::ShardPushEntryProto;
 using ::tpu_sync::rpc::StartTransferRequest;
-
-class ScopedEnvVar {
- public:
-  ScopedEnvVar(const char* name, const char* value) : name_(name) {
-    const char* prev = std::getenv(name);
-    if (prev != nullptr) {
-      prev_ = prev;
-    }
-    setenv(name, value, /*overwrite=*/1);
-  }
-
-  ~ScopedEnvVar() {
-    if (prev_.has_value()) {
-      setenv(name_, prev_->c_str(), /*overwrite=*/1);
-    } else {
-      unsetenv(name_);
-    }
-  }
-
-  ScopedEnvVar(const ScopedEnvVar&) = delete;
-  ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
-
- private:
-  const char* name_;
-  std::optional<std::string> prev_;
-};
 
 kv_cache::KVCacheManagerBase MakeTestBase() {
   return kv_cache::KVCacheManagerBase(
@@ -481,12 +454,13 @@ TEST(ReshardReceiveSessionTest, GroupScopesDestinationBlocks) {
 }
 
 TEST(ReshardReceiveSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
-  ScopedEnvVar staging_env("TPU_RAIDEN_NUM_STAGING_LAYERS", "1");
   kv_cache::KVCacheManagerBase base(
       /*num_layers=*/2, /*num_shards=*/1,
       /*slice_byte_size=*/128,
       /*local_port=*/std::nullopt,
-      /*host_blocks_to_allocate=*/std::make_optional(4));
+      /*host_blocks_to_allocate=*/std::make_optional(4),
+      /*parallelism=*/1, /*host_allocator=*/nullptr,
+      /*bind_ip=*/std::nullopt, /*num_staging_layers=*/1);
   base.AttachPlaceholderDeviceHoldForTest();
   ASSERT_EQ(base.num_host_layers(), 1u);
   ASSERT_EQ(base.num_layers(), 2u);

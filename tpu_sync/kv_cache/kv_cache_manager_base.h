@@ -117,7 +117,9 @@ using HostBlockId = int64_t;
 class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
  public:
   // Core C++ Constructor wrapping raw PJRT buffers directly (used by JAX and
-  // PyTorch E2E)
+  // PyTorch E2E). |num_staging_layers| bounds the host mirror along the layer
+  // dimension to that many host layer buffers, in [1, num_layers]; unset keeps
+  // one host buffer per layer. Throws std::invalid_argument when out of range.
   KVCacheManagerBase(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
       std::optional<int> local_port = std::nullopt,
@@ -127,26 +129,30 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<std::string> bind_ip = std::nullopt,
       std::optional<size_t> logical_slice_byte_size = std::nullopt,
       std::vector<int64_t> logical_dimensions = {},
-      std::optional<size_t> logical_physical_size = std::nullopt);
+      std::optional<size_t> logical_physical_size = std::nullopt,
+      std::optional<int> num_staging_layers = std::nullopt);
 
-  // Standard CPU-only constructor for remote workers E2E.
+  // Standard CPU-only constructor for remote workers E2E. |num_staging_layers|
+  // as in the device-buffer constructor.
   KVCacheManagerBase(size_t num_layers, size_t num_shards,
                      size_t slice_byte_size,
                      std::optional<int> local_port = std::nullopt,
                      std::optional<int> host_blocks_to_allocate = std::nullopt,
                      int parallelism = 1,
                      HostBufferAllocator host_allocator = nullptr,
-                     std::optional<std::string> bind_ip = std::nullopt);
+                     std::optional<std::string> bind_ip = std::nullopt,
+                     std::optional<int> num_staging_layers = std::nullopt);
 
   // same as above, but with a vector of slice byte sizes for heterogeneous
-  // registration.
+  // registration. |num_staging_layers| as in the device-buffer constructor.
   KVCacheManagerBase(size_t num_layers, size_t num_shards,
                      std::vector<size_t> slice_byte_sizes,
                      std::optional<int> local_port = std::nullopt,
                      std::optional<int> host_blocks_to_allocate = std::nullopt,
                      int parallelism = 1,
                      HostBufferAllocator host_allocator = nullptr,
-                     std::optional<std::string> bind_ip = std::nullopt);
+                     std::optional<std::string> bind_ip = std::nullopt,
+                     std::optional<int> num_staging_layers = std::nullopt);
 
   ~KVCacheManagerBase() override;
 
@@ -796,7 +802,7 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
                                int block_id) override;
 
   // Returns the number of allocated host layer buffers (equals num_layers()
-  // unless bounded via TPU_RAIDEN_NUM_STAGING_LAYERS).
+  // unless bounded via the num_staging_layers constructor argument).
   size_t num_host_layers() const { return layers_.size(); }
 
   // Returns the total number of bytes allocated in host DRAM.

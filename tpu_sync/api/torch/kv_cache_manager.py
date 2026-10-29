@@ -118,6 +118,7 @@ class KVCacheManager:
       worker_id: Optional[str] = None,
       enable_shm: bool = False,
       backend_configs: Optional[Sequence[Any]] = None,
+      num_staging_layers: Optional[int] = None,
   ):
     """Instantiates the TransferEngine-based KVCacheManager.
 
@@ -157,9 +158,25 @@ class KVCacheManager:
         and set `<axis>_rank` to this worker's rank in [0, size). Duplicate or
         missing ranks cause wrong or missed recalls. An invalid config aborts
         the process (LOG(FATAL)) at registration.
+      num_staging_layers: Optional number of host staging layer buffers to
+        allocate, in [1, num_layers]. Layer-major transfers lease these buffers
+        per layer, bounding host DRAM to num_staging_layers x num_slots x
+        max_blocks blocks instead of a full per-layer mirror. None keeps one
+        host buffer per layer. Only valid on the (max_blocks, num_slots) path.
     """
     self._admission_summary = None
     impl = _torch_impl()
+    if num_staging_layers is not None:
+      if host_blocks_to_allocate is not None:
+        raise ValueError(
+            "num_staging_layers is not supported with host_blocks_to_allocate."
+        )
+      # Checked here, before the C++ constructor pins the TPU buffers.
+      if not 1 <= num_staging_layers <= len(kv_caches):
+        raise ValueError(
+            f"num_staging_layers={num_staging_layers} must be in"
+            f" [1, {len(kv_caches)}] (number of kv_caches layers)."
+        )
     if host_blocks_to_allocate is not None:
       self._impl = impl.KVCacheManager(
           kv_caches,
@@ -195,6 +212,7 @@ class KVCacheManager:
           raiden_controller_address=raiden_controller_address,
           worker_id=worker_id,
           enable_shm=enable_shm,
+          num_staging_layers=num_staging_layers,
       )
     if backend_configs:
       self._impl.register_kv_backends(list(backend_configs))

@@ -60,7 +60,8 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
       const std::vector<at::Tensor>& kv_caches, int64_t node_id,
       int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
       double timeout_s, bool unsafe_skip_buffer_lock, int parallelism = 4,
-      std::optional<int> listener_port = std::nullopt, bool enable_shm = false);
+      std::optional<int> listener_port = std::nullopt, bool enable_shm = false,
+      std::optional<int> num_staging_layers = std::nullopt);
 
   ~TorchKVCacheManager() override;
 
@@ -129,7 +130,8 @@ class TorchKVCacheManager : public KVCacheManagerWithTransfer {
                       bool unsafe_skip_buffer_lock, int parallelism,
                       int64_t node_id, int64_t local_control_port,
                       int64_t max_blocks, int64_t num_slots, double timeout_s,
-                      std::vector<at::Tensor> kv_caches, bool enable_shm);
+                      std::vector<at::Tensor> kv_caches, bool enable_shm,
+                      std::optional<int> num_staging_layers = std::nullopt);
 
   std::vector<at::Tensor> kv_caches_;
   // Keep-alives for the materialized device buffers backing the manager.
@@ -157,8 +159,10 @@ class KVCacheManager {
   // Creates a transfer-enabled manager over the flat list of per-layer
   // tensors in |kv_caches| (single shard per layer). |enable_shm| opts this
   // manager's host buffers into the shared-memory segments named by
-  // RAIDEN_SHM_KEY; without it the env var is ignored. Failure modes as for
-  // the cache-only Create().
+  // RAIDEN_SHM_KEY; without it the env var is ignored. |num_staging_layers|
+  // bounds the host mirror to that many host layer buffers (see
+  // KVCacheManagerBase). Failure modes as for the cache-only Create(), plus
+  // InvalidArgument for an out-of-range |num_staging_layers|.
   static absl::StatusOr<std::unique_ptr<KVCacheManager>> CreateWithNodeId(
       const std::vector<at::Tensor>& kv_caches, int64_t node_id,
       int64_t local_control_port, int64_t max_blocks, int64_t num_slots,
@@ -167,7 +171,8 @@ class KVCacheManager {
       int raiden_worker_port = 0,
       std::optional<std::string> raiden_controller_address = std::nullopt,
       std::optional<std::string> worker_id = std::nullopt,
-      bool enable_shm = false);
+      bool enable_shm = false,
+      std::optional<int> num_staging_layers = std::nullopt);
 
   ~KVCacheManager();
 

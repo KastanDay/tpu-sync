@@ -23,6 +23,7 @@
 #include <ios>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -2406,20 +2407,22 @@ class ScopedEnvVar {
 
 struct BoundedStagingTestRig {
   static constexpr size_t kBlockBytes = 128;
+  static constexpr size_t kNumLayers = 2;
 
   std::unique_ptr<xla::PjRtClient> client;
   std::vector<std::unique_ptr<xla::PjRtBuffer>> pjrt_buffers;
+  std::vector<std::vector<raiden::RaidenBufferHandle>> layer_handles;
   std::unique_ptr<KVCacheManagerBase> manager;
 
-  void Init() {
+  void InitDeviceLayers() {
     TF_ASSERT_OK_AND_ASSIGN(client,
                             xla::GetXlaPjrtCpuClient(xla::CpuClientOptions()));
     TF_ASSERT_OK_AND_ASSIGN(
         xla::PjRtMemorySpace * memory_space,
         client->addressable_devices()[0]->default_memory_space());
 
-    std::vector<std::vector<raiden::RaidenBufferHandle>> layer_handles(2);
-    for (size_t layer = 0; layer < 2; ++layer) {
+    layer_handles.resize(kNumLayers);
+    for (size_t layer = 0; layer < kNumLayers; ++layer) {
       std::vector<uint8_t> init_data(kBlockBytes,
                                      static_cast<uint8_t>(0xA0 + layer));
       TF_ASSERT_OK_AND_ASSIGN(
@@ -2435,22 +2438,31 @@ struct BoundedStagingTestRig {
       pjrt_buffers.push_back(std::move(buf));
       layer_handles[layer].push_back(std::move(handle));
     }
+  }
 
-    manager = std::make_unique<KVCacheManagerBase>(
+  std::unique_ptr<KVCacheManagerBase> CreateManager(
+      std::optional<int> num_staging_layers) {
+    return std::make_unique<KVCacheManagerBase>(
         layer_handles, /*local_port=*/std::nullopt,
         /*host_blocks_to_allocate=*/1,
         /*unsafe_skip_buffer_lock=*/true, /*parallelism=*/1,
         /*host_allocator=*/nullptr, /*bind_ip=*/std::nullopt,
-        /*logical_slice_byte_size=*/kBlockBytes);
+        /*logical_slice_byte_size=*/kBlockBytes,
+        /*logical_dimensions=*/std::vector<int64_t>{},
+        /*logical_physical_size=*/std::nullopt, num_staging_layers);
+  }
+
+  void Init(int num_staging_layers) {
+    ASSERT_NO_FATAL_FAILURE(InitDeviceLayers());
+    manager = CreateManager(num_staging_layers);
   }
 };
 
 TEST(KVCacheManagerTest, AllLayerDispatchWithBoundedStagingFailsImmediately) {
-  ScopedEnvVar staging_env("TPU_RAIDEN_NUM_STAGING_LAYERS", "1");
   ScopedEnvVar async_env("RAIDEN_ENABLE_ASYNC_DISPATCH", "1");
 
   BoundedStagingTestRig rig;
-  ASSERT_NO_FATAL_FAILURE(rig.Init());
+  ASSERT_NO_FATAL_FAILURE(rig.Init(/*num_staging_layers=*/1));
   ASSERT_EQ(rig.manager->num_host_layers(), 1);
 
   uint8_t* host_ptr =
@@ -2462,22 +2474,22 @@ TEST(KVCacheManagerTest, AllLayerDispatchWithBoundedStagingFailsImmediately) {
   // without issuing layer 0's copy or queueing a background task.
   EXPECT_THAT(rig.manager->H2dSyncDispatch({0}, {0}, {1}),
               StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+                       HasSubstr("num_staging_layers")));
   EXPECT_THAT(rig.manager->H2dSyncDispatch(),
               StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+                       HasSubstr("num_staging_layers")));
   EXPECT_THAT(rig.manager->D2hSyncDispatch({0}, {0}, {1}),
               StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+                       HasSubstr("num_staging_layers")));
   EXPECT_THAT(rig.manager->D2hSyncDispatch(),
               StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+                       HasSubstr("num_staging_layers")));
   EXPECT_THAT(rig.manager->H2d({0}, {0}, {1}),
               StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+                       HasSubstr("num_staging_layers")));
   EXPECT_THAT(rig.manager->D2h({0}, {0}, {1}),
               StatusIs(absl::StatusCode::kFailedPrecondition,
-                       HasSubstr("TPU_RAIDEN_NUM_STAGING_LAYERS")));
+                       HasSubstr("num_staging_layers")));
 
   // Host buffer 0 was never overwritten by a partial D2H of layer 0, and
   // device layer 0 was never overwritten by a partial H2D of 0x55.
@@ -2496,11 +2508,10 @@ TEST(KVCacheManagerTest, AllLayerDispatchWithBoundedStagingFailsImmediately) {
 }
 
 TEST(KVCacheManagerTest, SingleLayerDispatchWithBoundedStagingSucceeds) {
-  ScopedEnvVar staging_env("TPU_RAIDEN_NUM_STAGING_LAYERS", "1");
   ScopedEnvVar async_env("RAIDEN_ENABLE_ASYNC_DISPATCH", "1");
 
   BoundedStagingTestRig rig;
-  ASSERT_NO_FATAL_FAILURE(rig.Init());
+  ASSERT_NO_FATAL_FAILURE(rig.Init(/*num_staging_layers=*/1));
   ASSERT_EQ(rig.manager->num_host_layers(), 1);
 
   uint8_t* host_ptr =
@@ -2549,6 +2560,34 @@ TEST(KVCacheManagerTest, SingleLayerDispatchWithBoundedStagingSucceeds) {
   EXPECT_EQ(std::vector<uint8_t>(host_ptr,
                                  host_ptr + BoundedStagingTestRig::kBlockBytes),
             std::vector<uint8_t>(BoundedStagingTestRig::kBlockBytes, 0xB1));
+}
+
+TEST(KVCacheManagerTest, NumStagingLayersBoundsHostLayerBuffers) {
+  BoundedStagingTestRig rig;
+  ASSERT_NO_FATAL_FAILURE(rig.InitDeviceLayers());
+
+  // Unset keeps one host buffer per layer; a value in [1, num_layers]
+  // allocates exactly that many.
+  EXPECT_EQ(rig.CreateManager(std::nullopt)->num_host_layers(),
+            BoundedStagingTestRig::kNumLayers);
+  EXPECT_EQ(
+      rig.CreateManager(BoundedStagingTestRig::kNumLayers)->num_host_layers(),
+      BoundedStagingTestRig::kNumLayers);
+  std::unique_ptr<KVCacheManagerBase> bounded = rig.CreateManager(1);
+  EXPECT_EQ(bounded->num_layers(), BoundedStagingTestRig::kNumLayers);
+  EXPECT_EQ(bounded->num_host_layers(), 1);
+  EXPECT_NE(bounded->GetHostPointer(/*layer_idx=*/0, /*shard_idx=*/0), nullptr);
+  EXPECT_EQ(bounded->GetHostPointer(/*layer_idx=*/1, /*shard_idx=*/0), nullptr);
+
+  // Out-of-range values are rejected rather than silently clamped.
+  EXPECT_THROW(rig.CreateManager(0), std::invalid_argument);
+  EXPECT_THROW(rig.CreateManager(-1), std::invalid_argument);
+  EXPECT_THROW(rig.CreateManager(BoundedStagingTestRig::kNumLayers + 1),
+               std::invalid_argument);
+
+  // Validation also runs for an empty cache, which otherwise returns early.
+  rig.layer_handles.clear();
+  EXPECT_THROW(rig.CreateManager(1), std::invalid_argument);
 }
 
 }  // namespace

@@ -45,7 +45,6 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
-#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
@@ -415,17 +414,24 @@ std::vector<transport::ShardInfo> BuildDefaultShards(size_t num_shards) {
   return shards;
 }
 
-// TPU_RAIDEN_NUM_STAGING_LAYERS: number of host layer buffers to allocate.
-// Unset, unparsable, zero, or >= |num_layers| keeps the full per-layer mirror.
-size_t ResolveEnvNumStagingLayers(size_t num_layers) {
-  const char* raw_env = std::getenv("TPU_RAIDEN_NUM_STAGING_LAYERS");
-  size_t requested = 0;
-  if (raw_env == nullptr || !absl::SimpleAtoi(raw_env, &requested) ||
-      requested == 0 || requested >= num_layers) {
+// Number of host layer buffers to allocate: |num_staging_layers| when set,
+// which must lie in [1, |num_layers|]; otherwise the full per-layer mirror.
+size_t ResolveNumStagingLayers(size_t num_layers,
+                               std::optional<int> num_staging_layers) {
+  if (!num_staging_layers.has_value()) {
     return num_layers;
   }
-  LOG(INFO) << "KVCacheManagerBase: allocating " << requested << "/"
-            << num_layers << " host staging layer buffers";
+  if (*num_staging_layers < 1 ||
+      static_cast<size_t>(*num_staging_layers) > num_layers) {
+    throw std::invalid_argument(
+        absl::StrCat("num_staging_layers (", *num_staging_layers,
+                     ") must be in [1, ", num_layers, "]"));
+  }
+  const size_t requested = static_cast<size_t>(*num_staging_layers);
+  if (requested < num_layers) {
+    LOG(INFO) << "KVCacheManagerBase: allocating " << requested << "/"
+              << num_layers << " host staging layer buffers";
+  }
   return requested;
 }
 
@@ -439,7 +445,7 @@ absl::Status CheckAllLayersHaveHostBuffers(
     return absl::FailedPreconditionError(absl::StrCat(
         direction, " of every layer needs a host buffer per layer, but only ",
         num_host_layers, " of ", num_layers,
-        " are allocated (TPU_RAIDEN_NUM_STAGING_LAYERS)"));
+        " are allocated (num_staging_layers)"));
   }
   return absl::OkStatus();
 }
@@ -453,7 +459,8 @@ KVCacheManagerBase::KVCacheManagerBase(
     HostBufferAllocator host_allocator, std::optional<std::string> bind_ip,
     std::optional<size_t> logical_slice_byte_size,
     std::vector<int64_t> logical_dimensions,
-    std::optional<size_t> logical_physical_size)
+    std::optional<size_t> logical_physical_size,
+    std::optional<int> num_staging_layers)
     : RaidenManagerBase(
           layer_buffers.size(), raiden::DetectShards(layer_buffers),
           logical_slice_byte_size.has_value()
@@ -464,6 +471,10 @@ KVCacheManagerBase::KVCacheManagerBase(
           local_port, parallelism, bind_ip,
           raiden::DetectNumaNodes(layer_buffers), GetLocalHostNicAddresses()),
       host_allocator_(host_allocator) {
+  // Validate before the empty-cache early return so an out-of-range value is
+  // rejected regardless of how many layers were registered.
+  const size_t num_host_layers_to_allocate =
+      ResolveNumStagingLayers(num_layers_, num_staging_layers);
   if (num_layers_ == 0 || num_shards_ == 0) {
     return;
   }
@@ -538,9 +549,8 @@ KVCacheManagerBase::KVCacheManagerBase(
     buffer_holds_.push_back(std::move(device_info));
   }
   absl::StatusOr<HostLayers> host_layers = AllocateHostLayers(
-      num_layers_, num_shards_,
-      /*num_layers_to_allocate=*/ResolveEnvNumStagingLayers(num_layers_),
-      num_host_blocks, buffer_holds_, host_allocator);
+      num_layers_, num_shards_, num_host_layers_to_allocate, num_host_blocks,
+      buffer_holds_, host_allocator);
   if (!host_layers.ok()) {
     // Constructors cannot return a status; a failed host allocation surfaces
     // the way it always has.
@@ -567,17 +577,18 @@ KVCacheManagerBase::KVCacheManagerBase(
     size_t num_layers, size_t num_shards, size_t slice_byte_size,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, HostBufferAllocator host_allocator,
-    std::optional<std::string> bind_ip)
+    std::optional<std::string> bind_ip, std::optional<int> num_staging_layers)
     : KVCacheManagerBase(num_layers, num_shards,
                          std::vector<size_t>(num_layers, slice_byte_size),
                          local_port, host_blocks_to_allocate, parallelism,
-                         std::move(host_allocator), std::move(bind_ip)) {}
+                         std::move(host_allocator), std::move(bind_ip),
+                         num_staging_layers) {}
 
 KVCacheManagerBase::KVCacheManagerBase(
     size_t num_layers, size_t num_shards, std::vector<size_t> slice_byte_sizes,
     std::optional<int> local_port, std::optional<int> host_blocks_to_allocate,
     int parallelism, HostBufferAllocator host_allocator,
-    std::optional<std::string> bind_ip)
+    std::optional<std::string> bind_ip, std::optional<int> num_staging_layers)
     : RaidenManagerBase(num_layers, BuildDefaultShards(num_shards),
                         slice_byte_sizes.empty() ? 0 : slice_byte_sizes[0],
                         local_port, parallelism, bind_ip),
@@ -600,7 +611,8 @@ KVCacheManagerBase::KVCacheManagerBase(
 
   absl::StatusOr<HostLayers> host_layers = AllocateHostLayers(
       num_layers_, num_shards_,
-      /*num_layers_to_allocate=*/ResolveEnvNumStagingLayers(num_layers_),
+      /*num_layers_to_allocate=*/
+      ResolveNumStagingLayers(num_layers_, num_staging_layers),
       /*num_host_blocks=*/total_blocks, /*device_layers=*/{}, host_allocator);
   if (!host_layers.ok()) {
     throw std::runtime_error(std::string(host_layers.status().message()));
