@@ -193,6 +193,18 @@ TEST_F(WeightSynchronizerTest, PushWeightsHeterogeneousCorrectness) {
   }
 }
 
+// A layer with no shards has no device buffer to size the host staging buffers
+// from, so Create() must fail instead of indexing shard 0. The Torch facade
+// passes `[[]]` through to this overload unchanged.
+TEST_F(WeightSynchronizerTest, CreateRejectsLayerWithNoShards) {
+  const std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers(1);
+
+  absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> ws =
+      WeightSynchronizerBase::Create(layer_buffers);
+
+  EXPECT_EQ(ws.status().code(), absl::StatusCode::kInvalidArgument);
+}
+
 TEST_F(WeightSynchronizerTest, CustomLayerNamesInitialization) {
   size_t num_layers = 2;
   size_t num_shards = 1;

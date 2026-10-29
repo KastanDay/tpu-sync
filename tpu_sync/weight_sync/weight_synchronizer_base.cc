@@ -365,6 +365,15 @@ WeightSynchronizerBase::Create(
     bool unsafe_skip_buffer_lock, int parallelism,
     std::optional<int> listener_port, std::optional<std::string> bind_ip,
     std::vector<std::string> layer_names, bool auto_h2d) {
+  // The constructor sizes the synchronizer from layer_buffers[0][0], so every
+  // layer must have at least one shard before it runs.
+  for (size_t layer_idx = 0; layer_idx < layer_buffers.size(); ++layer_idx) {
+    if (layer_buffers[layer_idx].empty()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "WeightSynchronizerBase::Create: layer ", layer_idx,
+          " has no shards; every layer needs at least one device buffer"));
+    }
+  }
   auto ws = absl::WrapUnique(new WeightSynchronizerBase(
       layer_buffers, local_port, parallelism, std::move(bind_ip),
       std::move(layer_names), auto_h2d));
