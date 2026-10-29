@@ -16,6 +16,7 @@ import TpuSyncVerify.Transfer.PrefillDecode.Caller
 import TpuSyncVerify.Transfer.Reshard.Receive
 import TpuSyncVerify.Transfer.Reshard.Send
 import TpuSyncVerify.Transfer.Reshard.Pipeline
+import TpuSyncVerify.Transfer.Reshard.MultiRequest
 import TpuSyncVerify.Transfer.Reshard.Coverage
 import TpuSyncVerify.Transfer.Reshard.PoolStaging
 import TpuSyncVerify.Transfer.Reshard.Registry
