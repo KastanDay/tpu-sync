@@ -196,7 +196,7 @@ TEST(KVCacheManagerWrapperTest,
 }
 
 TEST(KVCacheManagerWrapperTest,
-     AnyFailureImmediatelyTriggersFailedRecvingAndSuppressesFutureAcks) {
+     FailureWaitsForSiblingSubManagersBeforeEmittingFailedRecving) {
   auto sub0 = std::make_unique<MockSubManager>();
   auto sub1 = std::make_unique<MockSubManager>();
   MockSubManager* ptr0 = sub0.get();
@@ -209,18 +209,152 @@ TEST(KVCacheManagerWrapperTest,
   TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
                           KVCacheManager::Create(std::move(subs)));
 
-  // 1. sub0 reports failure for req_fail
+  // 1. sub0 reports failure for req_fail, but sibling sub1 still has DMAs
+  // in flight. CompleteReadRaw must barrier-wait and not emit prematurely.
+  ptr0->failed.push_back("req_fail");
+  auto [s1, r1, f1] = mgr->CompleteReadRaw();
+  EXPECT_TRUE(s1.empty());
+  EXPECT_TRUE(r1.empty());
+  EXPECT_TRUE(f1.empty());
+
+  // 2. Later sub1 finishes recving for req_fail. Now that all sub-managers
+  // have reached terminal status, failed_recving is emitted and done_recving
+  // is suppressed.
+  ptr1->recving.push_back("req_fail");
+  auto [s2, r2, f2] = mgr->CompleteReadRaw();
+  EXPECT_TRUE(s2.empty());
+  EXPECT_TRUE(r2.empty());
+  EXPECT_EQ(f2, std::vector<std::string>{"req_fail"});
+
+  // 3. Verifies state cleanup & req_id reuse: a subsequent transfer reusing
+  // "req_fail" succeeds cleanly without being suppressed by the previous
+  // failure.
+  ptr0->recving.push_back("req_fail");
+  ptr1->recving.push_back("req_fail");
+  auto [s3, r3, f3] = mgr->CompleteReadRaw();
+  EXPECT_TRUE(s3.empty());
+  EXPECT_EQ(r3, std::vector<std::string>{"req_fail"});
+  EXPECT_TRUE(f3.empty());
+}
+
+TEST(KVCacheManagerWrapperTest,
+     FailureWhenAllSubManagersFailEmitsFailedRecvingOnce) {
+  auto sub0 = std::make_unique<MockSubManager>();
+  auto sub1 = std::make_unique<MockSubManager>();
+  MockSubManager* ptr0 = sub0.get();
+  MockSubManager* ptr1 = sub1.get();
+
+  std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
+  subs.push_back(std::move(sub0));
+  subs.push_back(std::move(sub1));
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
+
+  // 1. sub0 reports failure for req_fail.
+  ptr0->failed.push_back("req_fail");
+  auto [s1, r1, f1] = mgr->CompleteReadRaw();
+  EXPECT_TRUE(s1.empty());
+  EXPECT_TRUE(r1.empty());
+  EXPECT_TRUE(f1.empty());
+
+  // 2. sub1 also reports failure for req_fail.
+  ptr1->failed.push_back("req_fail");
+  auto [s2, r2, f2] = mgr->CompleteReadRaw();
+  EXPECT_TRUE(s2.empty());
+  EXPECT_TRUE(r2.empty());
+  EXPECT_EQ(f2, std::vector<std::string>{"req_fail"});
+
+  // 3. Subsequent poll returns nothing.
+  auto [s3, r3, f3] = mgr->CompleteReadRaw();
+  EXPECT_TRUE(s3.empty());
+  EXPECT_TRUE(r3.empty());
+  EXPECT_TRUE(f3.empty());
+}
+
+TEST(KVCacheManagerWrapperTest,
+     RecvFirstThenFailureWaitsForSubManagersAndEmitsFailure) {
+  auto sub0 = std::make_unique<MockSubManager>();
+  auto sub1 = std::make_unique<MockSubManager>();
+  MockSubManager* ptr0 = sub0.get();
+  MockSubManager* ptr1 = sub1.get();
+
+  std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
+  subs.push_back(std::move(sub0));
+  subs.push_back(std::move(sub1));
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
+
+  // 1. sub0 succeeds recving first.
+  ptr0->recving.push_back("req_fail");
+  auto [s1, r1, f1] = mgr->CompleteReadRaw();
+  EXPECT_TRUE(s1.empty());
+  EXPECT_TRUE(r1.empty());
+  EXPECT_TRUE(f1.empty());
+
+  // 2. sub1 fails. Overall transfer must emit failure, not success.
+  ptr1->failed.push_back("req_fail");
+  auto [s2, r2, f2] = mgr->CompleteReadRaw();
+  EXPECT_TRUE(s2.empty());
+  EXPECT_TRUE(r2.empty());
+  EXPECT_EQ(f2, std::vector<std::string>{"req_fail"});
+}
+
+TEST(KVCacheManagerWrapperTest,
+     SendFailureWaitsForSiblingSubManagersBeforeEmittingFailedRecving) {
+  auto sub0 = std::make_unique<MockSubManager>();
+  auto sub1 = std::make_unique<MockSubManager>();
+  MockSubManager* ptr0 = sub0.get();
+  MockSubManager* ptr1 = sub1.get();
+
+  std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
+  subs.push_back(std::move(sub0));
+  subs.push_back(std::move(sub1));
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
+
+  // 1. sub0 succeeds sending first.
+  ptr0->sending.push_back("req_send_fail");
+  auto [s1, r1, f1] = mgr->CompleteReadRaw();
+  EXPECT_TRUE(s1.empty());
+  EXPECT_TRUE(r1.empty());
+  EXPECT_TRUE(f1.empty());
+
+  // 2. sub1 fails sending. Overall transfer must emit failure, suppressing
+  // done_sending.
+  ptr1->failed.push_back("req_send_fail");
+  auto [s2, r2, f2] = mgr->CompleteReadRaw();
+  EXPECT_TRUE(s2.empty());
+  EXPECT_TRUE(r2.empty());
+  EXPECT_EQ(f2, std::vector<std::string>{"req_send_fail"});
+}
+
+TEST(KVCacheManagerWrapperTest,
+     SingleSubManagerFailureEmitsImmediatelyAndCleansUp) {
+  auto sub0 = std::make_unique<MockSubManager>();
+  MockSubManager* ptr0 = sub0.get();
+
+  std::vector<std::unique_ptr<KVCacheManagerWithTransfer>> subs;
+  subs.push_back(std::move(sub0));
+
+  TF_ASSERT_OK_AND_ASSIGN(std::unique_ptr<KVCacheManager> mgr,
+                          KVCacheManager::Create(std::move(subs)));
+
+  // 1. sub0 reports failure for req_fail. With 1 sub-manager, emitted
+  // immediately.
   ptr0->failed.push_back("req_fail");
   auto [s1, r1, f1] = mgr->CompleteReadRaw();
   EXPECT_TRUE(s1.empty());
   EXPECT_TRUE(r1.empty());
   EXPECT_EQ(f1, std::vector<std::string>{"req_fail"});
 
-  // 2. Later sub1 finishes recving for req_fail (should be suppressed)
-  ptr1->recving.push_back("req_fail");
+  // 2. Reuse req_fail for healthy transfer; state was erased so it succeeds.
+  ptr0->recving.push_back("req_fail");
   auto [s2, r2, f2] = mgr->CompleteReadRaw();
   EXPECT_TRUE(s2.empty());
-  EXPECT_TRUE(r2.empty());
+  EXPECT_EQ(r2, std::vector<std::string>{"req_fail"});
   EXPECT_TRUE(f2.empty());
 }
 

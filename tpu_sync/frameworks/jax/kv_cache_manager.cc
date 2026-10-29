@@ -641,36 +641,58 @@ NumaAwareKVCacheManager::CompleteReadRaw() {
   int num_subs = static_cast<int>(sub_managers_.size());
   if (num_subs == 0) return {};
 
+  auto process_completion = [&](const std::string& req) {
+    int expected = num_subs;
+    if (auto exp_it = req_expected_counts_.find(req);
+        exp_it != req_expected_counts_.end()) {
+      expected = exp_it->second;
+    }
+    int s_count = 0;
+    if (auto it = done_sending_counts_.find(req);
+        it != done_sending_counts_.end()) {
+      s_count = it->second;
+    }
+    int r_count = 0;
+    if (auto it = done_recving_counts_.find(req);
+        it != done_recving_counts_.end()) {
+      r_count = it->second;
+    }
+    int f_count = 0;
+    if (auto it = failed_recving_counts_.find(req);
+        it != failed_recving_counts_.end()) {
+      f_count = it->second;
+    }
+
+    if (s_count + r_count + f_count >= expected) {
+      if (f_count > 0) {
+        failed_recving.push_back(req);
+      } else if (r_count >= expected) {
+        done_recving.push_back(req);
+      } else if (s_count >= expected) {
+        done_sending.push_back(req);
+      } else {
+        failed_recving.push_back(req);
+      }
+      done_sending_counts_.erase(req);
+      done_recving_counts_.erase(req);
+      failed_recving_counts_.erase(req);
+      req_expected_counts_.erase(req);
+    }
+  };
+
   for (auto& sub : sub_managers_) {
     auto [s, r, f] = sub->CompleteReadRaw();
     for (const auto& req : s) {
       done_sending_counts_[req]++;
-      if (done_sending_counts_[req] == num_subs) {
-        done_sending.push_back(req);
-        done_sending_counts_.erase(req);
-      }
+      process_completion(req);
     }
     for (const auto& req : r) {
-      auto [cnt_it, inserted] = done_recving_counts_.emplace(req, 0);
-      cnt_it->second++;
-      int expected = num_subs;
-      if (auto exp_it = req_expected_counts_.find(req);
-          exp_it != req_expected_counts_.end()) {
-        expected = exp_it->second;
-      }
-      if (cnt_it->second >= expected) {
-        done_recving_counts_.erase(cnt_it);
-        req_expected_counts_.erase(req);
-        if (failed_recving_set_.find(req) == failed_recving_set_.end()) {
-          done_recving.push_back(req);
-        }
-        failed_recving_set_.erase(req);
-      }
+      done_recving_counts_[req]++;
+      process_completion(req);
     }
     for (const auto& req : f) {
-      if (failed_recving_set_.insert(req).second) {
-        failed_recving.push_back(req);
-      }
+      failed_recving_counts_[req]++;
+      process_completion(req);
     }
   }
   return {std::move(done_sending), std::move(done_recving),

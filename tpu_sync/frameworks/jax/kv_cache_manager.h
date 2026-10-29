@@ -286,8 +286,8 @@ class NumaAwareKVCacheManager {
 
   std::map<std::string, int> done_sending_counts_;
   std::map<std::string, int> done_recving_counts_;
+  std::map<std::string, int> failed_recving_counts_;
   std::map<std::string, int> req_expected_counts_;
-  std::set<std::string> failed_recving_set_;
   std::shared_ptr<MetricsCollector> metrics_collector_;
 };
 
