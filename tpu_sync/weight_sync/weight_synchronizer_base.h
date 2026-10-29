@@ -109,11 +109,11 @@ class WeightSynchronizerListener;
 
 class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
  public:
-  // Creates a synchronizer wrapping the raw PJRT buffers in |layer_buffers|
+  // Creates a synchronizer wrapping the raw PJRT buffers in `layer_buffers`
   // (outer index = layer, inner index = shard) and allocates (or, when
-  // |external_host_ptrs| is set, adopts) one host staging buffer per shard.
+  // `external_host_ptrs` is set, adopts) one host staging buffer per shard.
   // Returns InvalidArgument if the layers disagree on shard count or
-  // |external_host_ptrs| has fewer entries than shards, and ResourceExhausted
+  // `external_host_ptrs` has fewer entries than shards, and ResourceExhausted
   // if a host staging buffer cannot be allocated.
   static absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> Create(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
@@ -126,7 +126,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       std::vector<std::string> layer_names = {}, bool auto_h2d = false);
 
   // Creates a CPU-only synchronizer (no device buffers) for remote workers and
-  // mock E2E testing, with |slice_byte_size| bytes per layer. Returns
+  // mock E2E testing, with `slice_byte_size` bytes per layer. Returns
   // ResourceExhausted if a host staging buffer cannot be allocated.
   static absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> Create(
       size_t num_layers, size_t num_shards, size_t slice_byte_size,
@@ -136,8 +136,8 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       std::optional<std::string> bind_ip = std::nullopt,
       std::vector<std::string> layer_names = {}, bool auto_h2d = false);
 
-  // As above, with heterogeneous per-layer |slice_byte_sizes| and custom
-  // |layer_names|.
+  // As above, with heterogeneous per-layer `slice_byte_sizes` and custom
+  // `layer_names`.
   static absl::StatusOr<std::unique_ptr<WeightSynchronizerBase>> Create(
       size_t num_layers, size_t num_shards,
       std::vector<size_t> slice_byte_sizes,
@@ -246,10 +246,10 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // Must not be called from the receive path (OnLayerDataReceived /
   // OnDataReceived) since it may block on tiling scheduled there.
   virtual absl::StatusOr<raiden::PjRtCopyFuture> H2d(uint64_t uuid = 0);
-  // Tiles the host staging buffers of |layer_idx| into device layout and
+  // Tiles the host staging buffers of `layer_idx` into device layout and
   // copies the tiled bytes back into the same host buffers. No-op for shards
-  // without tiled layouts or when skip_tiling is set for |layer_idx| under
-  // |uuid|.
+  // without tiled layouts or when skip_tiling is set for `layer_idx` under
+  // `uuid`.
   absl::Status TileLayer(size_t layer_idx, uint64_t uuid = 0);
   virtual absl::StatusOr<raiden::PjRtCopyFuture> D2h(uint64_t uuid = 0);
   absl::StatusOr<raiden::PjRtCopyFuture> D2hLayer(
@@ -331,7 +331,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   }
   size_t GetPipelineGroupSize() const;
 
-  // Block-push completion. Counts the shards reported for |uuid| and runs the
+  // Block-push completion. Counts the shards reported for `uuid` and runs the
   // auto H2D (which copies every layer and shard) only once the count reaches
   // num_shards(); see block_push_shards_.
   absl::Status OnBlockShardsReceived(const std::vector<int>& block_ids,
@@ -382,6 +382,23 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   void RegisterH2dEndHook(absl::AnyInvocable<void(const absl::Status&)> hook)
       ABSL_LOCKS_EXCLUDED(h2d_hook_mu_);
 
+  // Returns the device buffers that currently back the bound weights, in the
+  // [layer][shard] form BindWeights() takes.
+  using DeviceBufferResolver = absl::AnyInvocable<
+      absl::StatusOr<std::vector<std::vector<raiden::RaidenBufferHandle>>>()>;
+
+  // Installs `resolver`, which is called to rebind the weights to the buffers
+  // that currently back them before every D2h(), every controller-driven push
+  // that runs a D2H, every H2d() and, with auto_h2d, whenever a receiver is
+  // armed for a new uuid. Frameworks whose tensors move to a new device buffer
+  // while keeping their identity (TorchTPU replaces a tensor's buffer on
+  // in-place ops) install one, so that transfers never copy a buffer the
+  // framework no longer uses. A resolver error fails the transfer, as does a
+  // buffer whose size differs from the bound one. Must be called before any
+  // transfer starts.
+  void SetDeviceBufferResolver(DeviceBufferResolver resolver)
+      ABSL_LOCKS_EXCLUDED(device_buffer_resolver_mu_);
+
   void ForgetPushProgress(uint64_t uuid) override;
 
  protected:
@@ -406,22 +423,22 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       std::vector<HostNicAddress> host_nics = GetLocalHostNicAddresses(),
       std::vector<transport::ShardInfo> shards = {});
 
-  // Takes PJRT holds on |layer_buffers| and sets up one host staging buffer
-  // per shard, adopting |external_host_ptrs| when provided. Starts the
-  // listener on |listener_port| when set.
+  // Takes PJRT holds on `layer_buffers` and sets up one host staging buffer
+  // per shard, adopting `external_host_ptrs` when provided. Starts the
+  // listener on `listener_port` when set.
   absl::Status InitDeviceBuffers(
       const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers,
       const std::optional<std::vector<const uint8_t*>>& external_host_ptrs,
       std::optional<int> listener_port);
-  // Allocates one host staging buffer per shard sized by |slice_byte_sizes|
+  // Allocates one host staging buffer per shard sized by `slice_byte_sizes`
   // (falling back to slice_byte_size() for missing entries). Starts the
-  // listener on |listener_port| when set.
+  // listener on `listener_port` when set.
   absl::Status InitHostBuffers(const std::vector<size_t>& slice_byte_sizes,
                                std::optional<int> listener_port);
 
-  // Records the shards of one block-push stream for |uuid| and returns true
+  // Records the shards of one block-push stream for `uuid` and returns true
   // once the shards reported so far reach num_shards(), i.e. the host buffers
-  // of |uuid| are complete and may be copied to device. Subclasses that
+  // of `uuid` are complete and may be copied to device. Subclasses that
   // override OnBlockShardsReceived() should gate their device copy on this.
   bool RecordBlockPushShards(absl::Span<const int> shard_ids, uint64_t uuid)
       ABSL_LOCKS_EXCLUDED(block_push_shards_mu_);
@@ -457,7 +474,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
 
  private:
   // Shared tail of InitDeviceBuffers()/InitHostBuffers(): starts the listener
-  // on |listener_port| when set, creates the auto-H2D pool and per-shard
+  // on `listener_port` when set, creates the auto-H2D pool and per-shard
   // scratchpads, and records the initial host-buffer occupancy metric.
   void FinishInit(std::optional<int> listener_port);
 
@@ -466,10 +483,30 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // Returns the on-device bytes of all shards of `layer_idx`, i.e. what one
   // D2H or H2D of the layer copies.
   size_t LayerDeviceBytes(size_t layer_idx) const;
-  // Runs the start hook, copies all layers of |uuid| to device and waits,
+  // Runs the start hook, copies all layers of `uuid` to device and waits,
   // then runs the end hook with the copy status, which is returned. Holds
-  // |h2d_hook_mu_| throughout so hooked H2Ds never overlap.
+  // `h2d_hook_mu_` throughout so hooked H2Ds never overlap.
   absl::Status HookedH2d(uint64_t uuid) ABSL_LOCKS_EXCLUDED(h2d_hook_mu_);
+
+  // Returns InvalidArgument unless `layer_buffers` has the bound number of
+  // layers and shards and every buffer has the bound shard's device size.
+  absl::Status CheckDeviceBuffersMatch(
+      const std::vector<std::vector<raiden::RaidenBufferHandle>>&
+          layer_buffers) const;
+  // Replaces buffer_holds_ with `layer_buffers`, which must have passed
+  // CheckDeviceBuffersMatch(), and clears weights_unbound_.
+  void ReplaceBufferHolds(
+      const std::vector<std::vector<raiden::RaidenBufferHandle>>&
+          layer_buffers);
+  // Rebinds the weights to the buffers `device_buffer_resolver_` returns. A
+  // no-op without a resolver or while the weights are unbound.
+  absl::Status RefreshDeviceBuffers()
+      ABSL_LOCKS_EXCLUDED(device_buffer_resolver_mu_);
+
+  // Guards the resolver and serializes RefreshDeviceBuffers() calls.
+  absl::Mutex device_buffer_resolver_mu_;
+  DeviceBufferResolver device_buffer_resolver_
+      ABSL_GUARDED_BY(device_buffer_resolver_mu_);
 
   // Guards the hooks and serializes hooked H2Ds. The destructor stops the
   // listener and transport server (waiting for in-flight callbacks) before any
@@ -490,7 +527,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   // Thread-safe.
   class LayerTileReady {
    public:
-    // Records |status| and wakes all waiters. Calls after the first are
+    // Records `status` and wakes all waiters. Calls after the first are
     // ignored.
     void Set(absl::Status status) ABSL_LOCKS_EXCLUDED(mu_);
     // Blocks until Set() has been called and returns the recorded status.
@@ -507,7 +544,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   struct PendingH2dState {
     // Number of layers with a non-zero expected chunk count, set by
     // RegisterExpectedLayerChunksLocal. OnDataReceived waits until
-    // |layer_futures| holds this many entries.
+    // `layer_futures` holds this many entries.
     size_t expected_layers = 0;
     // Per-layer futures scheduled by OnLayerDataReceived, keyed by layer index.
     absl::flat_hash_map<size_t,
@@ -520,23 +557,23 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
     absl::flat_hash_map<size_t, std::shared_ptr<LayerTileReady>> tile_ready;
   };
 
-  // Blocks until every expected layer of |uuid| has scheduled its future via
+  // Blocks until every expected layer of `uuid` has scheduled its future via
   // OnLayerDataReceived, then removes and returns those futures.
   absl::flat_hash_map<size_t,
                       std::future<absl::StatusOr<raiden::PjRtCopyFuture>>>
   TakeLayerFuturesWhenScheduled(uint64_t uuid)
       ABSL_LOCKS_EXCLUDED(pending_h2d_mu_);
 
-  // Returns true if skip_tiling is set for |layer_idx| under |uuid|, falling
-  // back to the latest stored skip_tiling when |uuid| is unknown.
+  // Returns true if skip_tiling is set for `layer_idx` under `uuid`, falling
+  // back to the latest stored skip_tiling when `uuid` is unknown.
   bool IsTilingSkipped(size_t layer_idx, uint64_t uuid)
       ABSL_LOCKS_EXCLUDED(skip_tiling_mu_);
   // Returns the StartTransferRequest.host_tiling_mode the receiver was armed
-  // with for |uuid|, normalized so that UNSPECIFIED becomes
+  // with for `uuid`, normalized so that UNSPECIFIED becomes
   // HOST_TILING_MODE_DEFERRED.
   tpu_sync::rpc::HostTilingMode GetReceiverTiling(uint64_t uuid)
       ABSL_LOCKS_EXCLUDED(skip_tiling_mu_);
-  // Sets the in-place tiling signal of |layer_idx|; nullptr marks the layer's
+  // Sets the in-place tiling signal of `layer_idx`; nullptr marks the layer's
   // host buffers as holding logical-layout bytes.
   void SetLayerTileReady(size_t layer_idx,
                          std::shared_ptr<LayerTileReady> ready)
@@ -548,7 +585,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   std::unique_ptr<tpu_raiden::NumaThreadPool> h2d_pool_;
   absl_nonnull std::unique_ptr<tpu_raiden::NumaThreadPool> push_pool_;
   // Runs ForEachShardNumaLocal()'s per-shard tasks (tiling, H2D/D2H issue).
-  // Separate from |h2d_pool_| so that H2d() never waits on tasks queued behind
+  // Separate from `h2d_pool_` so that H2d() never waits on tasks queued behind
   // its own caller. It has one thread per shard, so a task on it must never
   // block on another task of this pool (e.g. H2d() waiting for in-place tiling
   // done by TileLayer()).
@@ -564,7 +601,7 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
     std::shared_ptr<void> owner ABSL_GUARDED_BY(mu);
     std::unique_ptr<uint8_t[], void (*)(void*)> owned_buffer ABSL_GUARDED_BY(
         mu) = {nullptr, [](void*) {}};
-    // Copy that still reads (H2D) or writes (D2H) |ptr|. Awaited before the
+    // Copy that still reads (H2D) or writes (D2H) `ptr`. Awaited before the
     // buffer is reused or reallocated.
     xla::Future<> in_flight_future ABSL_GUARDED_BY(mu);
   };
@@ -574,12 +611,12 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
       ShardScratchpad& sp, size_t required_bytes,
       const xla::PjRtDevice* device) ABSL_EXCLUSIVE_LOCKS_REQUIRED(sp.mu);
 
-  // Returns the per-layer skip-tiling mask for |uuid|, falling back to the
+  // Returns the per-layer skip-tiling mask for `uuid`, falling back to the
   // latest mask set via SetSkipTiling() and then to all-false.
   std::vector<bool> GetActiveSkipTiling(uint64_t uuid);
 
-  // Starts the host-to-device copy of shard |shard_idx| of layer |layer_idx|.
-  // If |tile| is true and the shard has a tiled layout, first tiles the host
+  // Starts the host-to-device copy of shard `shard_idx` of layer `layer_idx`.
+  // If `tile` is true and the shard has a tiled layout, first tiles the host
   // bytes into the shard's scratchpad and copies that; otherwise copies the
   // host bytes as is. Tiling runs on the calling thread before this returns;
   // the copy is asynchronous. Safe to call concurrently for distinct shards;
@@ -587,13 +624,13 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
   absl::StatusOr<xla::Future<raiden::BufferHolder>> H2dShard(size_t layer_idx,
                                                              size_t shard_idx,
                                                              bool tile);
-  // Copies all shards of |layer_idx| to device via H2dShard().
+  // Copies all shards of `layer_idx` to device via H2dShard().
   absl::StatusOr<raiden::PjRtCopyFuture> H2dLayer(size_t layer_idx, bool tile);
-  // Starts the device-to-host copy of shard |shard_idx| of layer |layer_idx|
+  // Starts the device-to-host copy of shard `shard_idx` of layer `layer_idx`
   // into its host staging buffer. If the shard has a tiled layout and
-  // |skip_tiling| is false, copies into the shard's scratchpad and detiles into
+  // `skip_tiling` is false, copies into the shard's scratchpad and detiles into
   // the staging buffer once the copy completes, recording the detile time in
-  // |max_detile_ms| when non-null. Errors are returned as a failed future.
+  // `max_detile_ms` when non-null. Errors are returned as a failed future.
   xla::Future<raiden::BufferHolder> D2hShard(
       size_t layer_idx, size_t shard_idx, bool skip_tiling,
       std::shared_ptr<std::atomic<double>> max_detile_ms);
@@ -602,19 +639,19 @@ class WeightSynchronizerBase : public tpu_raiden::RaidenManagerBase {
     size_t shard_idx;
     const tpu_sync::rpc::ShardPushScheduleProto& schedule;
   };
-  // Returns the local shards that have an entry in |request|'s
+  // Returns the local shards that have an entry in `request`'s
   // shard_push_schedules (keyed by global or local shard index, or by sorted
   // key order for zero-based slicing), in ascending shard order. The
-  // references point into |request|.
+  // references point into `request`.
   absl::StatusOr<std::vector<ShardPushSchedule>> ResolveShardPushSchedules(
       const tpu_sync::rpc::StartTransferRequest& request);
-  // Expands |request|'s shard_push_schedules into per-layer push tasks.
+  // Expands `request`'s shard_push_schedules into per-layer push tasks.
   absl::StatusOr<std::vector<std::vector<transport::BufferPushTask>>>
   BuildLayerPushTasks(const tpu_sync::rpc::StartTransferRequest& request);
-  // Returns the scratchpad of shard |shard_idx|.
+  // Returns the scratchpad of shard `shard_idx`.
   absl::StatusOr<ShardScratchpad*> GetTiledScratchpad(size_t shard_idx);
-  // Tiles the host bytes of shard |shard_idx| of layer |layer_idx| into |sp|
-  // and records tiling metrics. Returns the tiled bytes, valid while |sp.mu|
+  // Tiles the host bytes of shard `shard_idx` of layer `layer_idx` into `sp`
+  // and records tiling metrics. Returns the tiled bytes, valid while `sp.mu`
   // is held.
   absl::StatusOr<absl::Span<const uint8_t>> TileShardLocked(size_t layer_idx,
                                                             size_t shard_idx,

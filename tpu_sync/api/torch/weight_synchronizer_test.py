@@ -33,6 +33,53 @@ _SMALL_SLICE_BYTES = 1024 * 1024
 # is refused immediately, so this only bounds a hung handshake.
 _CONNECT_TIMEOUT_SECS = 5.0
 
+# Layer shapes for the bit-exact tests: one multiple of the TPU tile, and others
+# of several ranks that are not, so device layouts carry padding.
+_CORRECTNESS_SHAPES = ((256, 1024), (3, 100, 7), (1000,), (2, 3, 17, 130), (1,))
+
+# Integer dtype of the same width as each tested dtype, for bitwise comparison.
+_BITS_DTYPE = {
+    torch.float32: torch.int32,
+    torch.bfloat16: torch.int16,
+    torch.float16: torch.int16,
+    torch.int32: torch.int32,
+    torch.int8: torch.int8,
+}
+
+
+def _random_weights(
+    dtype: torch.dtype, num_shards: int, step: int
+) -> list[list[torch.Tensor]]:
+  """Returns CPU [layer][shard] tensors of random values for one sync step.
+
+  Every (step, layer, shard) gets its own seed, so a misplaced element, a
+  swapped shard or layer, or a stale step all show up as mismatches, unlike a
+  constant fill.
+
+  Args:
+    dtype: Element type of every tensor.
+    num_shards: Number of shards per layer.
+    step: Sync step, so that consecutive steps carry different values.
+  """
+  weights = []
+  for layer, shape in enumerate(_CORRECTNESS_SHAPES):
+    shards = []
+    for shard in range(num_shards):
+      generator = torch.Generator().manual_seed(
+          step * 1_000_003 + layer * 1_009 + shard
+      )
+      if dtype.is_floating_point:
+        shards.append(torch.randn(shape, generator=generator).to(dtype))
+      else:
+        info = torch.iinfo(dtype)
+        shards.append(
+            torch.randint(
+                info.min, info.max, shape, generator=generator, dtype=dtype
+            )
+        )
+    weights.append(shards)
+  return weights
+
 
 def _listener_accepts_connections(port: int) -> bool:
   """Returns whether a TCP listener accepts connections on 127.0.0.1:port."""
@@ -808,6 +855,207 @@ class WeightSynchronizerTorchTest(parameterized.TestCase):
     self.assertEqual(m_reset["d2h_call_count"], 0)
     self.assertEqual(m_reset["total_h2d_bytes"], 0)
     self.assertEqual(m_reset["total_h2d_time_ms"], 0.0)
+
+  def _to_device(
+      self, weights: list[list[torch.Tensor]]
+  ) -> list[list[torch.Tensor]]:
+    return [[t.to(self.device) for t in shards] for shards in weights]
+
+  def _zeros_on_device(
+      self, weights: list[list[torch.Tensor]]
+  ) -> list[list[torch.Tensor]]:
+    return [
+        [torch.zeros_like(t, device=self.device) for t in shards]
+        for shards in weights
+    ]
+
+  def _copy_in_place(
+      self,
+      tensors: list[list[torch.Tensor]],
+      values: list[list[torch.Tensor]],
+  ) -> None:
+    """Overwrites device `tensors` in place, as an optimizer step does."""
+    for shards, new_shards in zip(tensors, values, strict=True):
+      for tensor, new_tensor in zip(shards, new_shards, strict=True):
+        tensor.copy_(new_tensor.to(self.device))
+
+  def _assert_bit_exact(
+      self,
+      actual: list[list[torch.Tensor]],
+      expected: list[list[torch.Tensor]],
+      label: str,
+  ) -> None:
+    """Asserts that device tensors hold exactly the bits of CPU tensors."""
+    for layer, (actual_shards, expected_shards) in enumerate(
+        zip(actual, expected, strict=True)
+    ):
+      for shard, (got, want) in enumerate(
+          zip(actual_shards, expected_shards, strict=True)
+      ):
+        got = got.cpu()
+        where = f"{label}: layer {layer} {tuple(want.shape)} shard {shard}"
+        self.assertEqual(got.shape, want.shape, where)
+        self.assertEqual(got.dtype, want.dtype, where)
+        bits = _BITS_DTYPE[want.dtype]
+        mismatches = (got.view(bits) != want.view(bits)).nonzero()
+        if mismatches.numel():
+          self.fail(
+              f"{where}: {mismatches.shape[0]} of {want.numel()} elements"
+              f" differ, first at index {tuple(mismatches[0].tolist())}"
+          )
+
+  def _send_control_request(
+      self, port: int, request: raiden_service_pb2.ControlRequest
+  ) -> None:
+    payload = request.SerializeToString()
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM, 0) as sock:
+      sock.connect(("::1", port))
+      sock.sendall(len(payload).to_bytes(4, "big") + payload)
+      response_len = int.from_bytes(sock.recv(4), "big")
+      response = raiden_service_pb2.ControlResponse()
+      response.ParseFromString(sock.recv(response_len))
+    self.assertTrue(response.success, response.message)
+
+  def _push_resharded(
+      self,
+      sender: WeightSynchronizer,
+      receiver: WeightSynchronizer,
+      weights: list[list[torch.Tensor]],
+      uuid: int,
+      host_tiling_mode: raiden_service_pb2.HostTilingMode,
+  ) -> None:
+    """Pushes every layer of every shard to the same shard of `receiver`.
+
+    Sends the requests the controller sends when sender and receiver have the
+    same sharding: the receiver is armed for one chunk per layer and shard, and
+    the sender gets one whole-layer entry per layer and shard.
+
+    Args:
+      sender: Synchronizer that pushes.
+      receiver: Synchronizer that receives.
+      weights: The [layer][shard] tensors being synchronized, for their sizes.
+      uuid: Transfer id.
+      host_tiling_mode: Layout the receiver keeps its host buffers in.
+    """
+    num_shards = len(weights[0])
+    self._send_control_request(
+        receiver.listener_port,
+        raiden_service_pb2.ControlRequest(
+            command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+            start_transfer_request=raiden_service_pb2.StartTransferRequest(
+                is_sender=False,
+                uuid=uuid,
+                expected_block_count=len(weights) * num_shards,
+                expected_layer_chunk_counts={
+                    layer: num_shards for layer in range(len(weights))
+                },
+                host_tiling_mode=host_tiling_mode,
+            ),
+        ),
+    )
+    request = raiden_service_pb2.StartTransferRequest(is_sender=True, uuid=uuid)
+    for shard in range(num_shards):
+      schedule = request.shard_push_schedules[shard]
+      for layer, shards in enumerate(weights):
+        entry = schedule.entries.add()
+        entry.dst_peer = f"127.0.0.1:{receiver.local_port}"
+        entry.dst_shard_idx = shard
+        entry.size_bytes = shards[shard].numel() * shards[shard].element_size()
+        entry.layer_idx = layer
+    self._send_control_request(
+        sender.listener_port,
+        raiden_service_pb2.ControlRequest(
+            command=raiden_service_pb2.ControlRequest.COMMAND_START_TRANSFER,
+            start_transfer_request=request,
+        ),
+    )
+
+  def test_push_weights_sends_in_place_updates(self):
+    """Pushes send the values of in-place updates made after construction."""
+    dtype = torch.bfloat16
+    src_tensors = self._to_device(_random_weights(dtype, num_shards=2, step=0))
+    dst_tensors = self._zeros_on_device(src_tensors)
+    ws_source = WeightSynchronizer(
+        src_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        dst_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_dest.shutdown)
+
+    for step in range(1, 4):
+      expected = _random_weights(dtype, num_shards=2, step=step)
+      self._copy_in_place(src_tensors, expected)
+
+      ws_source.push_weights([f"127.0.0.1:{ws_dest.local_port}"])
+      ws_dest.h2d()
+
+      self._assert_bit_exact(dst_tensors, expected, f"step {step}")
+
+  def test_h2d_reaches_receiver_tensors_updated_in_place(self):
+    """H2D lands in receiver tensors that were updated in place after binding."""
+    dtype = torch.bfloat16
+    expected = _random_weights(dtype, num_shards=2, step=1)
+    src_tensors = self._to_device(expected)
+    dst_tensors = self._to_device(_random_weights(dtype, num_shards=2, step=0))
+    ws_source = WeightSynchronizer(
+        src_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        dst_tensors, local_port=0, parallelism=1, bind_ip="127.0.0.1"
+    )
+    self.addCleanup(ws_dest.shutdown)
+    for shards in dst_tensors:
+      for tensor in shards:
+        tensor.zero_()
+
+    ws_source.push_weights([f"127.0.0.1:{ws_dest.local_port}"])
+    ws_dest.h2d()
+
+    self._assert_bit_exact(dst_tensors, expected, "receiver")
+
+  @parameterized.named_parameters(
+      ("deferred_tiling", raiden_service_pb2.HOST_TILING_MODE_DEFERRED),
+      ("tiling_on_arrival", raiden_service_pb2.HOST_TILING_MODE_ON_ARRIVAL),
+  )
+  def test_resharded_push_with_auto_h2d_sends_in_place_updates(
+      self, host_tiling_mode
+  ):
+    """Controller-driven pushes with auto-H2D, as RL trainers and samplers run."""
+    dtype = torch.bfloat16
+    src_tensors = self._to_device(_random_weights(dtype, num_shards=2, step=0))
+    dst_tensors = self._zeros_on_device(src_tensors)
+    ws_source = WeightSynchronizer(
+        src_tensors,
+        local_port=0,
+        parallelism=2,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+    )
+    self.addCleanup(ws_source.shutdown)
+    ws_dest = WeightSynchronizer(
+        dst_tensors,
+        local_port=0,
+        parallelism=2,
+        listener_port=0,
+        bind_ip="127.0.0.1",
+        auto_h2d=True,
+    )
+    self.addCleanup(ws_dest.shutdown)
+
+    for step in range(1, 3):
+      uuid = 81000 + step
+      expected = _random_weights(dtype, num_shards=2, step=step)
+      self._copy_in_place(src_tensors, expected)
+
+      self._push_resharded(
+          ws_source, ws_dest, expected, uuid, host_tiling_mode
+      )
+      ws_dest.wait_for_transfer_completion(uuid)
+
+      self._assert_bit_exact(dst_tensors, expected, f"step {step}")
 
 
 if __name__ == "__main__":

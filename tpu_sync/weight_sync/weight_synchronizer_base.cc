@@ -769,6 +769,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
         "WeightSynchronizer device weights are unbound; call bind_weights() "
         "before H2d.");
   }
+  ABSL_RETURN_IF_ERROR(RefreshDeviceBuffers());
   if (buffer_holds_.empty()) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
@@ -849,7 +850,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::H2d(
   auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
   if (store.HasBackends()) {
     // Tiling runs on the shard pool after this returns, so sample its metric
-    // once the copies are done. |this| outlives in-flight copies.
+    // once the copies are done. `this` outlives in-flight copies.
     joined.OnReady([this, start_time, uuid](const auto& result) {
       if (result.ok()) {
         auto& store = telemetry::RaidenMetricStore::GetGlobalMetricStore();
@@ -1011,6 +1012,7 @@ absl::StatusOr<raiden::PjRtCopyFuture> WeightSynchronizerBase::D2h(
         "WeightSynchronizer device weights are unbound; call bind_weights() "
         "before D2h.");
   }
+  ABSL_RETURN_IF_ERROR(RefreshDeviceBuffers());
   if (buffer_holds_.empty()) {
     return raiden::PjRtCopyFuture(std::vector<raiden::BufferHolder>{});
   }
@@ -1106,7 +1108,7 @@ WeightSynchronizerBase::ResolveShardPushSchedules(
   const auto& schedules = request.shard_push_schedules();
   // Schedules are keyed by local shard index unless some key falls outside
   // the local index space, in which case they are keyed by global index. An
-  // empty |local_shard_indices_| denotes the identity mapping [0, num_shards_).
+  // empty `local_shard_indices_` denotes the identity mapping [0, num_shards_).
   bool use_global_keys = false;
   if (!global_shard_indices_.empty()) {
     for (const auto& [sched_key, _] : schedules) {
@@ -1411,6 +1413,15 @@ absl::Status WeightSynchronizerBase::PushWeightsReshardedLocal(
       VLOG(1)
           << "PushWeightsResharded: Executing pipelined D2H copies for uuid "
           << uuid;
+      absl::Status refresh_status = RefreshDeviceBuffers();
+      if (!refresh_status.ok()) {
+        if (d2h_state != nullptr) {
+          absl::MutexLock lock(d2h_state->mu);
+          d2h_state->status = refresh_status;
+          d2h_state->all_ready = true;
+        }
+        return refresh_status;
+      }
       for (size_t l = 0; l < num_layers_; ++l) {
         auto f_or = D2hLayer(l, uuid);
         if (!f_or.ok()) {
@@ -1694,21 +1705,7 @@ absl::Status WeightSynchronizerBase::BindWeights(
     UnbindWeights();
     return absl::OkStatus();
   }
-  if (layer_buffers.size() != num_layers_) {
-    return absl::InvalidArgumentError("Number of layers mismatch");
-  }
-  for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
-    if (layer_buffers[layer_idx].size() != num_shards_) {
-      return absl::InvalidArgumentError("Number of shards mismatch");
-    }
-    for (size_t shard_idx = 0; shard_idx < num_shards_; ++shard_idx) {
-      const auto& new_buffer = layer_buffers[layer_idx][shard_idx];
-      size_t new_size = new_buffer.GetOnDeviceSizeInBytes();
-      if (new_size != layers_[layer_idx].shards[shard_idx].device_size) {
-        return absl::InvalidArgumentError("Buffer size mismatch");
-      }
-    }
-  }
+  ABSL_RETURN_IF_ERROR(CheckDeviceBuffersMatch(layer_buffers));
 
   xla::PjRtClient* client = nullptr;
   if (!layer_buffers.empty() && !layer_buffers[0].empty()) {
@@ -1732,6 +1729,33 @@ absl::Status WeightSynchronizerBase::BindWeights(
     }
   }
 
+  ReplaceBufferHolds(layer_buffers);
+  return absl::OkStatus();
+}
+
+absl::Status WeightSynchronizerBase::CheckDeviceBuffersMatch(
+    const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers)
+    const {
+  if (layer_buffers.size() != num_layers_) {
+    return absl::InvalidArgumentError("Number of layers mismatch");
+  }
+  for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
+    if (layer_buffers[layer_idx].size() != num_shards_) {
+      return absl::InvalidArgumentError("Number of shards mismatch");
+    }
+    for (size_t shard_idx = 0; shard_idx < num_shards_; ++shard_idx) {
+      const auto& new_buffer = layer_buffers[layer_idx][shard_idx];
+      size_t new_size = new_buffer.GetOnDeviceSizeInBytes();
+      if (new_size != layers_[layer_idx].shards[shard_idx].device_size) {
+        return absl::InvalidArgumentError("Buffer size mismatch");
+      }
+    }
+  }
+  return absl::OkStatus();
+}
+
+void WeightSynchronizerBase::ReplaceBufferHolds(
+    const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers) {
   buffer_holds_.clear();
   buffer_holds_.reserve(num_layers_);
   for (size_t layer_idx = 0; layer_idx < num_layers_; ++layer_idx) {
@@ -1759,6 +1783,25 @@ absl::Status WeightSynchronizerBase::BindWeights(
     buffer_holds_.push_back(std::move(hold_info));
   }
   weights_unbound_ = false;
+}
+
+void WeightSynchronizerBase::SetDeviceBufferResolver(
+    DeviceBufferResolver resolver) {
+  absl::MutexLock lock(device_buffer_resolver_mu_);
+  device_buffer_resolver_ = std::move(resolver);
+}
+
+absl::Status WeightSynchronizerBase::RefreshDeviceBuffers() {
+  absl::MutexLock lock(device_buffer_resolver_mu_);
+  if (device_buffer_resolver_ == nullptr || weights_unbound_) {
+    return absl::OkStatus();
+  }
+  RAIDEN_TRACE("WeightSynchronizerBase::RefreshDeviceBuffers");
+  ABSL_ASSIGN_OR_RETURN(
+      std::vector<std::vector<raiden::RaidenBufferHandle>> layer_buffers,
+      device_buffer_resolver_());
+  ABSL_RETURN_IF_ERROR(CheckDeviceBuffersMatch(layer_buffers));
+  ReplaceBufferHolds(layer_buffers);
   return absl::OkStatus();
 }
 
@@ -1797,9 +1840,22 @@ absl::Status WeightSynchronizerBase::RegisterExpectedLayerChunksLocal(
   //
   // A tree broadcast re-arms each receiver with the same uuid and the full
   // counts before every pipeline stage, so layers that already have a signal
-  // or have been received under |uuid| are left alone.
+  // or have been received under `uuid` are left alone.
   const bool signal_layers =
       GetReceiverTiling(uuid) != tpu_sync::rpc::HOST_TILING_MODE_DEFERRED;
+  if (auto_h2d_) {
+    // Auto-H2D copies each layer as it arrives, so resolve the device buffers
+    // once per uuid, before any of its data can arrive. A re-arm of the same
+    // uuid may race that uuid's in-flight H2Ds and must not rebind.
+    bool is_new_uuid;
+    {
+      absl::MutexLock lock(pending_h2d_mu_);
+      is_new_uuid = !pending_h2d_states_.contains(uuid);
+    }
+    if (is_new_uuid) {
+      ABSL_RETURN_IF_ERROR(RefreshDeviceBuffers());
+    }
+  }
   {
     absl::MutexLock lock(pending_h2d_mu_);
     bool is_new_uuid = !pending_h2d_states_.contains(uuid);
@@ -2126,7 +2182,7 @@ void WeightSynchronizerBase::StoreSkipTilingLocal(
 
 bool WeightSynchronizerBase::RecordBlockPushShards(
     absl::Span<const int> shard_ids, uint64_t uuid) {
-  // Count the shards delivered for |uuid| and report completion only once all
+  // Count the shards delivered for `uuid` and report completion only once all
   // of them are in; H2d(uuid) copies all layers and shards and would otherwise
   // upload host buffers whose other shards are still in flight. An unrouted
   // stream carries every shard, so it completes at once (one H2D per stream,

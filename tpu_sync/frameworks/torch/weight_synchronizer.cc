@@ -24,11 +24,13 @@
 #include <utility>
 #include <vector>
 
+#include "absl/base/thread_annotations.h"
 #include "absl/memory/memory.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/synchronization/mutex.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "tpu_sync/core/raiden_transfer_endpoint.h"
 #include "tpu_sync/core/raw_transfer_core.h"
@@ -45,13 +47,43 @@ namespace tpu_raiden {
 namespace torch {
 
 #ifndef WITHOUT_PYTHON
+struct WeightSynchronizer::BoundTensors {
+  explicit BoundTensors(bool unsafe_skip_buffer_lock)
+      : unsafe_skip_buffer_lock(unsafe_skip_buffer_lock) {}
+
+  const bool unsafe_skip_buffer_lock;
+  absl::Mutex mu;
+  std::vector<std::vector<at::Tensor>> tensors ABSL_GUARDED_BY(mu);
+  // Handles of the most recently resolved device buffers, and of the buffers
+  // resolved before them, which the base may hold until it rebinds.
+  std::vector<torch_tpu::TensorBufferHandle> refs ABSL_GUARDED_BY(mu);
+  std::vector<torch_tpu::TensorBufferHandle> previous_refs ABSL_GUARDED_BY(mu);
+};
+
 WeightSynchronizer::WeightSynchronizer(
     std::unique_ptr<weight_sync::WeightSynchronizerBase> base,
-    bool unsafe_skip_buffer_lock,
-    std::vector<torch_tpu::TensorBufferHandle> buffer_refs)
-    : base_(std::move(base)),
-      unsafe_skip_buffer_lock_(unsafe_skip_buffer_lock),
-      buffer_refs_(std::move(buffer_refs)) {}
+    std::shared_ptr<BoundTensors> bound)
+    : base_(std::move(base)), bound_(std::move(bound)) {}
+
+absl::StatusOr<std::vector<std::vector<raiden::RaidenBufferHandle>>>
+WeightSynchronizer::ResolveDeviceBuffers(BoundTensors& bound) {
+  absl::MutexLock lock(bound.mu);
+  try {
+    UnpackedTensors unpacked =
+        UnpackTorchTensors(bound.tensors, bound.unsafe_skip_buffer_lock);
+    // Raw device copies do not wait for TorchTPU's pending executions.
+    for (torch_tpu::TensorBufferHandle& ref : unpacked.refs) {
+      ABSL_RETURN_IF_ERROR(ref.Synchronize());
+    }
+    bound.previous_refs = std::exchange(bound.refs, std::move(unpacked.refs));
+    return std::move(unpacked.buffers);
+  } catch (const std::exception& e) {
+    return absl::InternalError(absl::StrCat(
+        "WeightSynchronizer: resolving the device buffers of the bound tensors "
+        "failed: ",
+        e.what()));
+  }
+}
 
 absl::StatusOr<std::unique_ptr<WeightSynchronizer>> WeightSynchronizer::Create(
     const std::vector<std::vector<at::Tensor>>& device_tensors,
@@ -80,8 +112,16 @@ absl::StatusOr<std::unique_ptr<WeightSynchronizer>> WeightSynchronizer::Create(
     if (global_shard_indices.has_value()) {
       base->SetGlobalShardIndices(*std::move(global_shard_indices));
     }
-    return absl::WrapUnique(new WeightSynchronizer(
-        std::move(base), unsafe_skip_buffer_lock, std::move(unpacked.refs)));
+    auto bound = std::make_shared<BoundTensors>(unsafe_skip_buffer_lock);
+    {
+      absl::MutexLock lock(bound->mu);
+      bound->tensors = device_tensors;
+      bound->refs = std::move(unpacked.refs);
+    }
+    base->SetDeviceBufferResolver(
+        [bound]() { return ResolveDeviceBuffers(*bound); });
+    return absl::WrapUnique(
+        new WeightSynchronizer(std::move(base), std::move(bound)));
   } catch (const std::exception& e) {
     return absl::InternalError(
         absl::StrCat("WeightSynchronizer::Create failed: ", e.what()));
@@ -96,7 +136,7 @@ absl::Status WeightSynchronizer::BindWeights(
       return absl::OkStatus();
     }
     UnpackedTensors unpacked =
-        UnpackTorchTensors(device_tensors, unsafe_skip_buffer_lock_);
+        UnpackTorchTensors(device_tensors, bound_->unsafe_skip_buffer_lock);
     const std::vector<std::vector<raiden::RaidenBufferHandle>>& layer_buffers =
         unpacked.buffers;
     if (layer_buffers.empty()) {
@@ -113,9 +153,14 @@ absl::Status WeightSynchronizer::BindWeights(
           absl::StrCat("Shard count mismatch in BindWeights: expected ",
                        num_shards(), ", got ", layer_buffers[0].size()));
     }
+    // Held across the rebind so that a concurrent resolve sees either the old
+    // tensors and buffers or the new ones.
+    absl::MutexLock lock(bound_->mu);
     absl::Status status = base_->BindWeights(layer_buffers);
     if (!status.ok()) return status;
-    buffer_refs_ = std::move(unpacked.refs);
+    bound_->tensors = device_tensors;
+    bound_->refs = std::move(unpacked.refs);
+    bound_->previous_refs.clear();
     return absl::OkStatus();
   } catch (const std::exception& e) {
     return absl::InternalError(e.what());
@@ -124,12 +169,17 @@ absl::Status WeightSynchronizer::BindWeights(
 #endif
 
 void WeightSynchronizer::UnbindWeights() {
-#ifndef WITHOUT_PYTHON
-  buffer_refs_.clear();
-#endif
   if (base_) {
     base_->UnbindWeights();
   }
+#ifndef WITHOUT_PYTHON
+  if (bound_) {
+    absl::MutexLock lock(bound_->mu);
+    bound_->tensors.clear();
+    bound_->refs.clear();
+    bound_->previous_refs.clear();
+  }
+#endif
 }
 
 WeightSynchronizer::WeightSynchronizer(

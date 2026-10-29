@@ -28,7 +28,6 @@
 #include "tpu_sync/core/raw_transfer_core.h"
 #ifndef WITHOUT_PYTHON
 #include "ATen/core/TensorBody.h"
-#include "csrc/api/tensor_buffer.h"
 #endif
 #include "tpu_sync/weight_sync/weight_synchronizer_base.h"
 
@@ -43,8 +42,10 @@ namespace torch {
 
 // PyTorch facade over weight_sync::WeightSynchronizerBase. Unpacks at::Tensor
 // shards into PJRT buffer handles and keeps the tensor buffer references alive
-// for the lifetime of the binding. NUMA placement of host tiling, H2D and
-// transport listeners is handled by the base class per shard.
+// for the lifetime of the binding. TorchTPU moves a tensor to a new device
+// buffer on in-place ops, so the bound tensors' buffers are looked up again
+// before every D2H and H2D. NUMA placement of host tiling, H2D and transport
+// listeners is handled by the base class per shard.
 class WeightSynchronizer {
  public:
   WeightSynchronizer(const WeightSynchronizer&) = delete;
@@ -53,11 +54,11 @@ class WeightSynchronizer {
   WeightSynchronizer& operator=(WeightSynchronizer&&) = default;
 
 #ifndef WITHOUT_PYTHON
-  // Creates a synchronizer bound to |device_tensors| (outer index = layer,
+  // Creates a synchronizer bound to `device_tensors` (outer index = layer,
   // inner index = shard) and keeps their TPU buffer handles alive. Returns
-  // InvalidArgument if |device_tensors| yields no layer buffers and Internal
+  // InvalidArgument if `device_tensors` yields no layer buffers and Internal
   // if unpacking the tensors or constructing the underlying
-  // WeightSynchronizerBase throws. |global_shard_indices|, when set, overrides
+  // WeightSynchronizerBase throws. `global_shard_indices`, when set, overrides
   // the default identity local->global shard mapping.
   static absl::StatusOr<std::unique_ptr<WeightSynchronizer>> Create(
       const std::vector<std::vector<at::Tensor>>& device_tensors,
@@ -135,21 +136,29 @@ class WeightSynchronizer {
 
  private:
   // Used by test_only_create_cpu_instance(); adopts an already constructed
-  // |base|.
+  // `base`.
   explicit WeightSynchronizer(
       std::unique_ptr<weight_sync::WeightSynchronizerBase> base);
 #ifndef WITHOUT_PYTHON
-  // Used by Create(); adopts an already constructed |base| and the
-  // |buffer_refs| that pin the bound device tensors.
+  // The bound tensors and the handles that pin their device buffers; defined
+  // in the .cc file.
+  struct BoundTensors;
+
+  // Used by Create(); adopts an already constructed `base` and the `bound`
+  // tensors, whose buffers `base` resolves before every transfer.
   WeightSynchronizer(std::unique_ptr<weight_sync::WeightSynchronizerBase> base,
-                     bool unsafe_skip_buffer_lock,
-                     std::vector<torch_tpu::TensorBufferHandle> buffer_refs);
+                     std::shared_ptr<BoundTensors> bound);
+
+  // Returns the device buffers that currently back `bound`'s tensors, once
+  // pending TorchTPU writes to them have completed, and keeps them pinned.
+  static absl::StatusOr<std::vector<std::vector<raiden::RaidenBufferHandle>>>
+  ResolveDeviceBuffers(BoundTensors& bound);
 #endif
 
   std::unique_ptr<weight_sync::WeightSynchronizerBase> base_;
 #ifndef WITHOUT_PYTHON
-  bool unsafe_skip_buffer_lock_ = true;
-  std::vector<torch_tpu::TensorBufferHandle> buffer_refs_;
+  // Null for CPU-only instances.
+  std::shared_ptr<BoundTensors> bound_;
 #endif
 };
 
