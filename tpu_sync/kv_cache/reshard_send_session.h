@@ -103,8 +103,10 @@ class ReshardSendSession
   // has none and waiting until deadline when every slot is leased.
   absl::StatusOr<size_t> AcquireStagingSlot(size_t pool_idx);
 
-  // Returns the host staging buffer currently leased to |pool_idx|, or
-  // kFailedPrecondition if |pool_idx| holds no lease.
+  // Returns the host staging buffer currently leased to |pool_idx|. Fails
+  // with the session's status (or kCancelled) once the session is draining
+  // and holds no lease for |pool_idx|, and kFailedPrecondition when a live
+  // session holds none.
   absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const;
 
  private:

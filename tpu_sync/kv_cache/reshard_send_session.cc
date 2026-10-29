@@ -204,6 +204,13 @@ absl::StatusOr<size_t> ReshardSendSession::AcquireStagingSlot(size_t pool_idx) {
 
 absl::StatusOr<size_t> ReshardSendSession::LookupStagingSlot(
     size_t pool_idx) const {
+  // A lease outlives the session's finalizing_ flip: a push whose completion
+  // started finalizing may still be addressing another pool's host bytes.
+  // SettleLocked releases every lease, so a done session never resolves one.
+  if (std::optional<size_t> slot = staging_layer_manager_.Lookup(pool_idx);
+      slot.has_value()) {
+    return *slot;
+  }
   {
     absl::MutexLock lock(mu_);
     if (done_ || finalizing_) {
@@ -211,12 +218,8 @@ absl::StatusOr<size_t> ReshardSendSession::LookupStagingSlot(
                            : absl::CancelledError("Send session is draining");
     }
   }
-  std::optional<size_t> slot = staging_layer_manager_.Lookup(pool_idx);
-  if (!slot.has_value()) {
-    return absl::FailedPreconditionError(
-        absl::StrCat("Pool ", pool_idx, " has no leased staging slot"));
-  }
-  return *slot;
+  return absl::FailedPreconditionError(
+      absl::StrCat("Pool ", pool_idx, " has no leased staging slot"));
 }
 
 absl::Status ReshardSendSession::ValidatePushPreconditions() const {

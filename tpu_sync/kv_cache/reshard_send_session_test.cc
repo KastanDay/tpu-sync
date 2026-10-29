@@ -56,6 +56,13 @@ struct ReshardSendSessionTestPeer {
     return session.staging_layer_manager_.Release(pool_idx);
   }
 
+  // Issues `pool_idx`'s peer pushes as the D2H completion callback does.
+  static void StartPoolPush(ReshardSendSession& session,
+                            KVCacheManagerWithTransfer& manager,
+                            size_t pool_idx) {
+    session.StartPoolPush(manager, pool_idx);
+  }
+
   // Counts one (pool, peer) push of `session` in flight on `manager`, as
   // ExecutePush and StartPoolPush do before issuing it. The executor's device
   // copies are device-only, so deviceless tests drive the op accounting here.
@@ -529,6 +536,125 @@ TEST(ReshardSendSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
   EXPECT_THAT(timeout_session->AcquireStagingSlot(0), IsOkAndHolds(0u));
   EXPECT_THAT(timeout_session->AcquireStagingSlot(1),
               StatusIs(absl::StatusCode::kDeadlineExceeded));
+}
+
+// A precondition that needs no waiting fails ExecutePush synchronously, so
+// the START_TRANSFER reply carries it, and the send settles with its plan
+// dropped rather than waiting for the deadline sweep.
+TEST(ReshardSendSessionTest, ExecutePushFailsFastWithoutTransportServer) {
+  KVCacheManagerWithTransfer manager = MakeTestManager();
+  manager.base()->AttachPlaceholderDeviceHoldForTest();
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(manager.base(), /*num_slots=*/0,
+                                  /*max_blocks=*/0);
+  StartTransferRequest plan = ValidPlan(/*uuid=*/1401, /*dtype_tags=*/{""});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<ReshardSendSession> session,
+      ReshardSendSession::Create(
+          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          /*parallelism=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10), plan));
+  ASSERT_TRUE(manager.base()->HasActivePlan(plan.uuid()));
+
+  manager.base()->StopTransportServer();
+  EXPECT_THAT(session->ExecutePush(manager, std::vector<int64_t>{0}),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("transport server")));
+  EXPECT_TRUE(session->Done());
+  EXPECT_THAT(session->GetStatus(),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+  EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
+  // A finished send refuses further pushes with its terminal status.
+  EXPECT_THAT(session->ExecutePush(manager, std::vector<int64_t>{0}),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
+// A failure on the pipeline thread (here: the staging slot wait running
+// into the session deadline) is reported out of band: ExecutePush returns
+// OK, the send settles with the error, every lease is released, and the plan
+// is dropped.
+TEST(ReshardSendSessionTest, PipelineSlotWaitTimeoutSettlesSendOutOfBand) {
+  KVCacheManagerWithTransfer manager(
+      /*num_layers=*/2, /*num_shards=*/1, /*slice_byte_size=*/128,
+      /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/std::make_optional(4));
+  ASSERT_EQ(manager.base()->num_host_layers(), 2u);
+  std::vector<kv_cache::PoolSpec> pools = {
+      DensePool("fa", 128),
+      DensePool("state", 128),
+  };
+  pools[1].storage_index = 1;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools(pools));
+  manager.base()->AttachPlaceholderDeviceHoldForTest();
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(manager.base(), /*num_slots=*/0,
+                                  /*max_blocks=*/0);
+  StartTransferRequest plan = ValidPlan(
+      /*uuid=*/1402, /*dtype_tags=*/{"bf16", "bf16"},
+      /*transferred_pools=*/{0, 1});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<ReshardSendSession> session,
+      ReshardSendSession::Create(
+          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          /*parallelism=*/1,
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(200),
+          plan));
+
+  // Park every slot on units the pipeline never releases, so pool 0's
+  // AcquireStagingSlot can only end at the deadline.
+  constexpr size_t kParkedUnits[] = {7, 8};
+  EXPECT_THAT(session->AcquireStagingSlot(kParkedUnits[0]), IsOkAndHolds(0u));
+  EXPECT_THAT(session->AcquireStagingSlot(kParkedUnits[1]), IsOkAndHolds(1u));
+
+  ABSL_ASSERT_OK(session->ExecutePush(manager, std::vector<int64_t>{0}));
+  EXPECT_THAT(session->AwaitForDone(),
+              StatusIs(absl::StatusCode::kDeadlineExceeded));
+  EXPECT_TRUE(session->Done());
+  EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
+  // SettleLocked released the parked leases along with everything else.
+  for (size_t unit : kParkedUnits) {
+    EXPECT_THAT(session->LookupStagingSlot(unit),
+                StatusIs(absl::StatusCode::kDeadlineExceeded));
+  }
+  EXPECT_THAT(session->LookupStagingSlot(0),
+              StatusIs(absl::StatusCode::kDeadlineExceeded));
+}
+
+// A pool pushing to several peers keeps its staging slot until the last
+// peer push completes, then the send settles clean.
+TEST(ReshardSendSessionTest, StagingSlotReleasedAfterLastPeerPush) {
+  KVCacheManagerWithTransfer manager = MakeTestManager();
+  kv_cache::KVCacheManagerBase receiver_a = MakeTestBase();
+  kv_cache::KVCacheManagerBase receiver_b = MakeTestBase();
+  const std::string peer_a =
+      absl::StrCat("127.0.0.1:", receiver_a.transport_server()->local_port());
+  const std::string peer_b =
+      absl::StrCat("127.0.0.1:", receiver_b.transport_server()->local_port());
+  manager.base()->AttachPlaceholderDeviceHoldForTest();
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(manager.base(), /*num_slots=*/0,
+                                  /*max_blocks=*/0);
+  StartTransferRequest plan = ValidPlan(/*uuid=*/1403, /*dtype_tags=*/{""});
+  auto* schedule = &(*plan.mutable_shard_push_schedules())[0];
+  schedule->mutable_entries(0)->set_dst_peer(peer_a);
+  *schedule->add_entries() = schedule->entries(0);
+  schedule->mutable_entries(1)->set_dst_peer(peer_b);
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<ReshardSendSession> session,
+      ReshardSendSession::Create(
+          manager.base(), allocator.get(), std::vector<int64_t>{0},
+          /*parallelism=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(10), plan));
+
+  // Stage pool 0 as the pipeline would, then issue its two peer pushes.
+  EXPECT_THAT(session->AcquireStagingSlot(0), IsOkAndHolds(0u));
+  ReshardSendSessionTestPeer::StartPoolPush(*session, manager, /*pool_idx=*/0);
+
+  ABSL_EXPECT_OK(session->AwaitForDone());
+  EXPECT_TRUE(session->Done());
+  EXPECT_FALSE(manager.base()->HasActivePlan(plan.uuid()));
+  EXPECT_THAT(session->LookupStagingSlot(0),
+              StatusIs(absl::StatusCode::kCancelled));
 }
 
 }  // namespace
