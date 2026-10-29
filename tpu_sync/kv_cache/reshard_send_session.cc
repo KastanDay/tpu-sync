@@ -24,7 +24,8 @@
 #include <optional>
 #include <set>
 #include <string>
-#include <thread>  // NOLINT(build/c++11)
+#include <system_error>  // NOLINT(build/c++11)
+#include <thread>        // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
 
@@ -259,11 +260,21 @@ absl::Status ReshardSendSession::ExecutePush(
     return precondition;
   }
   std::vector<int64_t> src_ids(src_block_ids.begin(), src_block_ids.end());
-  std::thread([self = shared_from_this(), &manager,
-               src_ids = std::move(src_ids)]() mutable {
-    self->ExecutePushPipeline(manager, std::move(src_ids));
-    self->EndOp();
-  }).detach();
+  try {
+    std::thread([self = shared_from_this(), &manager,
+                 src_ids = std::move(src_ids)]() mutable {
+      self->ExecutePushPipeline(manager, std::move(src_ids));
+      self->EndOp();
+    }).detach();
+  } catch (const std::system_error& e) {
+    // Thread exhaustion: fail the send on the synchronous path so the session
+    // settles and the plan is dropped instead of waiting for the deadline
+    // sweep with the exception unwinding through the RPC handler.
+    absl::Status status = absl::InternalError(
+        absl::StrCat("failed to start pool reshard push thread: ", e.what()));
+    RecordPushCompletion(manager, status);
+    return status;
+  }
   std::move(end_op).Cancel();
   return absl::OkStatus();
 }
