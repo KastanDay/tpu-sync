@@ -15,6 +15,7 @@
 #include "tpu_sync/kv_cache/reshard_send_session.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +24,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>  // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
 
@@ -167,11 +169,71 @@ ReshardSendSession::ReshardSendSession(
       plan_(std::move(plan)),
       dst_peers_(std::move(dst_peers)),
       data_connection_reuse_(data_connection_reuse),
-      remaining_pool_peer_pushes_(remaining_pool_peer_pushes) {}
+      remaining_pool_peer_pushes_(remaining_pool_peer_pushes),
+      staging_layer_manager_(base != nullptr ? base->num_host_layers() : 0) {}
 
 ReshardSendSession::~ReshardSendSession() {
   absl::MutexLock lock(mu_);
   ReleaseLeasesLocked();
+}
+
+absl::StatusOr<size_t> ReshardSendSession::AcquireStagingSlot(size_t pool_idx) {
+  {
+    absl::MutexLock lock(mu_);
+    if (done_ || finalizing_) {
+      return !status_.ok() ? status_
+                           : absl::CancelledError("Send session is draining");
+    }
+  }
+  absl::StatusOr<size_t> slot =
+      staging_layer_manager_.Acquire(pool_idx, deadline_, &cancelled_);
+  if (!slot.ok()) {
+    return slot.status();
+  }
+  {
+    absl::MutexLock lock(mu_);
+    if (done_ || finalizing_) {
+      staging_layer_manager_.Release(pool_idx);
+      return !status_.ok() ? status_
+                           : absl::CancelledError("Send session is draining");
+    }
+  }
+  return *slot;
+}
+
+absl::StatusOr<size_t> ReshardSendSession::LookupStagingSlot(
+    size_t pool_idx) const {
+  {
+    absl::MutexLock lock(mu_);
+    if (done_ || finalizing_) {
+      return !status_.ok() ? status_
+                           : absl::CancelledError("Send session is draining");
+    }
+  }
+  std::optional<size_t> slot = staging_layer_manager_.Lookup(pool_idx);
+  if (!slot.has_value()) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("Pool ", pool_idx, " has no leased staging slot"));
+  }
+  return *slot;
+}
+
+absl::Status ReshardSendSession::ValidatePushPreconditions() const {
+  if (base_->transport_server() == nullptr) {
+    return absl::FailedPreconditionError("transport server is not running");
+  }
+  if (base_->num_host_layers() == 0) {
+    return absl::FailedPreconditionError(
+        "pool reshard push requires at least one host staging layer");
+  }
+  for (int32_t encoded_pool_idx : plan_.transfer_pool_indices()) {
+    const size_t pool_idx = static_cast<size_t>(encoded_pool_idx);
+    if (base_->pool(pool_idx) == nullptr) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("transfer pool index out of range: ", pool_idx));
+    }
+  }
+  return absl::OkStatus();
 }
 
 absl::Status ReshardSendSession::ExecutePush(
@@ -179,9 +241,35 @@ absl::Status ReshardSendSession::ExecutePush(
     absl::Span<const int64_t> src_block_ids) {
   {
     absl::MutexLock lock(mu_);
+    if (done_ || finalizing_) {
+      return !status_.ok() ? status_
+                           : absl::CancelledError("Send session is draining");
+    }
     ++in_flight_;
     manager_ = &manager;
   }
+  absl::Cleanup end_op = [this]() { EndOp(); };
+  // Fail fast on the plan-shape and transport preconditions that need no
+  // waiting, so the START_TRANSFER reply still carries them. Staging slot
+  // and arena leases can block on earlier pools' pushes and stay on the
+  // pipeline thread below.
+  if (absl::Status precondition = ValidatePushPreconditions();
+      !precondition.ok()) {
+    RecordPushCompletion(manager, precondition);
+    return precondition;
+  }
+  std::vector<int64_t> src_ids(src_block_ids.begin(), src_block_ids.end());
+  std::thread([self = shared_from_this(), &manager,
+               src_ids = std::move(src_ids)]() mutable {
+    self->ExecutePushPipeline(manager, std::move(src_ids));
+    self->EndOp();
+  }).detach();
+  std::move(end_op).Cancel();
+  return absl::OkStatus();
+}
+
+void ReshardSendSession::ExecutePushPipeline(
+    KVCacheManagerWithTransfer& manager, std::vector<int64_t> src_block_ids) {
   // Multi-tag plans scope each pool's staging and pushes to its group's
   // entries; the flat src_block_ids argument is the legacy single-tag
   // whole-plan block list.
@@ -201,8 +289,25 @@ absl::Status ReshardSendSession::ExecutePush(
     local_schedule_it = plan_.shard_push_schedules().begin();
   }
 
+  std::vector<size_t> ordered_pools;
+  ordered_pools.reserve(plan_.transfer_pool_indices_size());
   for (int32_t encoded_pool_idx : plan_.transfer_pool_indices()) {
-    const size_t pool_idx = static_cast<size_t>(encoded_pool_idx);
+    ordered_pools.push_back(static_cast<size_t>(encoded_pool_idx));
+  }
+  std::stable_sort(
+      ordered_pools.begin(), ordered_pools.end(), [&](size_t a, size_t b) {
+        const int ga = pool_group_index(a);
+        const int gb = pool_group_index(b);
+        const int rank_a = (ga >= 0 && ga < plan_.pool_groups_size())
+                               ? plan_.pool_groups(ga).order_rank()
+                               : 0;
+        const int rank_b = (gb >= 0 && gb < plan_.pool_groups_size())
+                               ? plan_.pool_groups(gb).order_rank()
+                               : 0;
+        return rank_a < rank_b;
+      });
+
+  for (size_t pool_idx : ordered_pools) {
     std::vector<int64_t> pool_src_block_ids(src_block_ids.begin(),
                                             src_block_ids.end());
     if (local_schedule_it != plan_.shard_push_schedules().end()) {
@@ -223,6 +328,20 @@ absl::Status ReshardSendSession::ExecutePush(
         continue;
       }
     }
+
+    absl::StatusOr<size_t> host_slot = AcquireStagingSlot(pool_idx);
+    if (!host_slot.ok()) {
+      RecordPushCompletion(manager, host_slot.status());
+      return;
+    }
+    {
+      absl::MutexLock lock(mu_);
+      if (done_ || finalizing_) {
+        staging_layer_manager_.Release(pool_idx);
+        return;
+      }
+    }
+
     // Bounded host staging: lease one arena slot per source page of this
     // pool's storage for the transfer before staging its bytes (no-op on
     // full-mirror storages). Released in SettleLocked.
@@ -233,16 +352,17 @@ absl::Status ReshardSendSession::ExecutePush(
           base_->pool_staging_lease_timeout());
       if (!lease_status.ok()) {
         RecordPushCompletion(manager, lease_status);
-        EndOp();
-        return lease_status;
+        staging_layer_manager_.Release(pool_idx);
+        return;
       }
     }
-    absl::StatusOr<raiden::PjRtCopyFuture> future = base_->D2hPoolBlocks(
-        pool_idx, pool_src_block_ids, /*shard_idx=*/std::nullopt, uuid_);
+    absl::StatusOr<raiden::PjRtCopyFuture> future =
+        base_->D2hPoolBlocks(pool_idx, pool_src_block_ids,
+                             /*shard_idx=*/std::nullopt, uuid_, *host_slot);
     if (!future.ok()) {
       RecordPushCompletion(manager, future.status());
-      EndOp();
-      return future.status();
+      staging_layer_manager_.Release(pool_idx);
+      return;
     }
     raiden::PjRtCopyFuture pool_future = *std::move(future);
     {
@@ -251,17 +371,16 @@ absl::Status ReshardSendSession::ExecutePush(
       ++in_flight_;
     }
     pool_future.OnReady(
-        [self = shared_from_this(), &manager, pool_idx](auto status_or) {
+        [self = shared_from_this(), &manager, pool_idx](auto copy_status) {
           absl::Cleanup end_op = [self]() { self->EndOp(); };
-          if (!status_or.ok()) {
-            self->RecordPushCompletion(manager, status_or.status());
+          if (!copy_status.ok()) {
+            self->RecordPushCompletion(manager, copy_status.status());
+            self->staging_layer_manager_.Release(pool_idx);
             return;
           }
           self->StartPoolPush(manager, pool_idx);
         });
   }
-  EndOp();
-  return absl::OkStatus();
 }
 
 void ReshardSendSession::StartPoolPush(KVCacheManagerWithTransfer& manager,
@@ -272,6 +391,7 @@ void ReshardSendSession::StartPoolPush(KVCacheManagerWithTransfer& manager,
   {
     absl::MutexLock lock(mu_);
     if (done_ || finalizing_) {
+      staging_layer_manager_.Release(pool_idx);
       return;
     }
   }
@@ -303,16 +423,25 @@ void ReshardSendSession::StartPoolPush(KVCacheManagerWithTransfer& manager,
     }
   }
 
+  auto remaining_pushes =
+      std::make_shared<std::atomic<int>>(transfers_by_peer.size());
+  if (transfers_by_peer.empty()) {
+    staging_layer_manager_.Release(pool_idx);
+    return;
+  }
+
   transport::BlockTransport* transport_srv = base_->transport_server();
   if (transport_srv == nullptr) {
     RecordPushCompletion(manager, absl::FailedPreconditionError(
                                       "transport server is not running"));
+    staging_layer_manager_.Release(pool_idx);
     return;
   }
 
   {
     absl::MutexLock lock(mu_);
     if (done_ || finalizing_) {
+      staging_layer_manager_.Release(pool_idx);
       return;
     }
     in_flight_ += static_cast<int>(transfers_by_peer.size());
@@ -339,12 +468,23 @@ void ReshardSendSession::StartPoolPush(KVCacheManagerWithTransfer& manager,
         ->AsyncPush({peer}, src_ids, dst_ids, parallelism_,
                     transport::MajorOrder::kLayerMajor, uuid_,
                     static_cast<int>(pool_idx), wire_pool_idx)
-        .OnReady([self = shared_from_this(),
-                  &manager](const absl::StatusOr<std::vector<int>>& result) {
-          absl::Cleanup end_op = [self]() { self->EndOp(); };
-          self->RecordPushCompletion(
-              manager, result.ok() ? absl::OkStatus() : result.status());
-        });
+        .OnReady(
+            [self = shared_from_this(), &manager, pool_idx,
+             remaining_pushes](const absl::StatusOr<std::vector<int>>& result) {
+              absl::Cleanup end_op = [self]() { self->EndOp(); };
+              const bool last_for_pool = remaining_pushes->fetch_sub(1) == 1;
+              if (!result.ok()) {
+                self->RecordPushCompletion(manager, result.status());
+                if (last_for_pool) {
+                  self->staging_layer_manager_.Release(pool_idx);
+                }
+                return;
+              }
+              if (last_for_pool) {
+                self->staging_layer_manager_.Release(pool_idx);
+              }
+              self->RecordPushCompletion(manager, absl::OkStatus());
+            });
   }
 }
 
@@ -364,9 +504,13 @@ void ReshardSendSession::RecordPushCompletion(
         status_ = status;
       }
       finalizing_ = true;
+      cancelled_.store(true, std::memory_order_relaxed);
+      staging_layer_manager_.Shutdown();
       should_unregister = !plan_unregistered_;
     } else if (--remaining_pool_peer_pushes_ == 0) {
       finalizing_ = true;
+      cancelled_.store(true, std::memory_order_relaxed);
+      staging_layer_manager_.Shutdown();
       should_unregister = !plan_unregistered_;
     }
     if (should_unregister) plan_unregistered_ = true;
@@ -398,6 +542,8 @@ void ReshardSendSession::Finish(const absl::Status& status) {
   }
   if (done_ || finalizing_) return;
   finalizing_ = true;
+  cancelled_.store(true, std::memory_order_relaxed);
+  staging_layer_manager_.Shutdown();
   // Settling here, with no op in flight, means no push was ever issued:
   // ExecutePush holds an op while it schedules, StartPoolPush counts every
   // push before issuing it, and each push stays counted until its completion
@@ -468,6 +614,7 @@ void ReshardSendSession::EndOp() {
 }
 
 void ReshardSendSession::ReleaseLeasesLocked() {
+  staging_layer_manager_.ReleaseAll();
   if (leases_released_) return;
   leases_released_ = true;
   base_->ReleasePoolStagingLeases(uuid_);
@@ -477,6 +624,8 @@ void ReshardSendSession::SettleLocked() {
   // Every push of every pool has completed (or the send failed): release the
   // host staging arena slots and mark done atomically under |mu_|.
   ReleaseLeasesLocked();
+  cancelled_.store(true, std::memory_order_relaxed);
+  staging_layer_manager_.Shutdown();
   done_ = true;
 }
 

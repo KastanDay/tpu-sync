@@ -33,6 +33,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
+#include "xla/tsl/platform/statusor.h"
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
@@ -48,6 +49,11 @@ struct ReshardSendSessionTestPeer {
       const ::tpu_sync::rpc::StartTransferRequest& plan,
       absl::Span<const int64_t> src_block_ids) {
     return ReshardSendSession::ValidatePlan(base, plan, src_block_ids);
+  }
+
+  static std::optional<size_t> ReleaseStagingSlot(ReshardSendSession& session,
+                                                  size_t pool_idx) {
+    return session.staging_layer_manager_.Release(pool_idx);
   }
 
   // Counts one (pool, peer) push of `session` in flight on `manager`, as
@@ -71,6 +77,7 @@ struct ReshardSendSessionTestPeer {
 
 namespace {
 
+using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::testing::AllOf;
 using ::testing::HasSubstr;
@@ -450,6 +457,78 @@ TEST(ReshardSendSessionTest, CreateRejectsUnknownDataConnReuseValue) {
                AllOf(HasSubstr("TPU_RAIDEN_DATA_CONN_REUSE"),
                      HasSubstr("per-transfer"))));
   EXPECT_FALSE(base.HasActivePlan(plan.uuid()));
+}
+
+TEST(ReshardSendSessionTest, BoundedStagingSlotAcquisitionAndRelease) {
+  kv_cache::KVCacheManagerBase base(
+      /*num_layers=*/2, /*num_shards=*/1,
+      /*slice_byte_size=*/128,
+      /*local_port=*/std::nullopt,
+      /*host_blocks_to_allocate=*/std::make_optional(4),
+      /*parallelism=*/1, /*host_allocator=*/nullptr,
+      /*bind_ip=*/std::nullopt, /*num_staging_layers=*/1);
+  base.AttachPlaceholderDeviceHoldForTest();
+  ASSERT_EQ(base.num_host_layers(), 1u);
+  ASSERT_EQ(base.num_layers(), 2u);
+
+  std::vector<kv_cache::PoolSpec> pools = {
+      DensePool("fa", 128),
+      DensePool("state", 128),
+  };
+  pools[1].storage_index = 1;
+  ABSL_ASSERT_OK(base.RegisterPools(pools));
+
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/0, /*max_blocks=*/0);
+  StartTransferRequest plan = ValidPlan(
+      /*uuid=*/1301, /*dtype_tags=*/{"bf16", "bf16"},
+      /*transferred_pools=*/{0, 1});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<ReshardSendSession> session,
+      ReshardSendSession::Create(
+          &base, allocator.get(), std::vector<int64_t>{0}, /*parallelism=*/1,
+          std::chrono::steady_clock::now() + std::chrono::seconds(2), plan));
+
+  // Pool 0 leases slot 0 (the only allocated host layer).
+  EXPECT_THAT(session->AcquireStagingSlot(0), IsOkAndHolds(0u));
+  EXPECT_THAT(session->LookupStagingSlot(0), IsOkAndHolds(0u));
+
+  // Pool 1 blocks waiting for slot 0 until pool 0 releases its lease.
+  absl::StatusOr<size_t> slot1;
+  std::thread release_waiter([&]() { slot1 = session->AcquireStagingSlot(1); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  EXPECT_EQ(ReshardSendSessionTestPeer::ReleaseStagingSlot(*session, 0),
+            std::make_optional(0u));
+  release_waiter.join();
+  EXPECT_THAT(slot1, IsOkAndHolds(0u));
+  EXPECT_THAT(session->LookupStagingSlot(1), IsOkAndHolds(0u));
+
+  // Cancelling the session while pool 0 is blocked in AcquireStagingSlot wakes
+  // the waiter with CancelledError and releases all staging slots on settle.
+  absl::StatusOr<size_t> slot0_cancelled;
+  std::thread cancel_waiter(
+      [&]() { slot0_cancelled = session->AcquireStagingSlot(0); });
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  session->Finish(absl::CancelledError("cancelled"));
+  cancel_waiter.join();
+  EXPECT_THAT(slot0_cancelled, StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_TRUE(session->Done());
+  EXPECT_THAT(session->LookupStagingSlot(1),
+              StatusIs(absl::StatusCode::kCancelled));
+
+  // Timeout when no slot is released before the session deadline.
+  StartTransferRequest timeout_plan = ValidPlan(
+      /*uuid=*/1302, /*dtype_tags=*/{"bf16", "bf16"},
+      /*transferred_pools=*/{0, 1});
+  TF_ASSERT_OK_AND_ASSIGN(
+      std::shared_ptr<ReshardSendSession> timeout_session,
+      ReshardSendSession::Create(
+          &base, allocator.get(), std::vector<int64_t>{0}, /*parallelism=*/1,
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(30),
+          timeout_plan));
+  EXPECT_THAT(timeout_session->AcquireStagingSlot(0), IsOkAndHolds(0u));
+  EXPECT_THAT(timeout_session->AcquireStagingSlot(1),
+              StatusIs(absl::StatusCode::kDeadlineExceeded));
 }
 
 }  // namespace

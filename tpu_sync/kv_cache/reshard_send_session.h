@@ -92,12 +92,31 @@ class ReshardSendSession
   int32_t sub_plan_count() const { return plan_.sub_plan_count(); }
 
   // Leases host staging per pool, issues D2H copies for each pool in |plan_|,
-  // and chains async H2H peer pushes upon D2H completion.
+  // and chains async H2H peer pushes upon D2H completion. Non-blocking
+  // preconditions (transport, host staging layers, pool indices) are checked
+  // synchronously and returned; the staging waits, copies and pushes run on
+  // a pipeline thread and report through GetStatus() / Done().
   absl::Status ExecutePush(KVCacheManagerWithTransfer& manager,
                            absl::Span<const int64_t> src_block_ids);
 
+  // Returns the host staging buffer leased to |pool_idx|, leasing one when it
+  // has none and waiting until deadline when every slot is leased.
+  absl::StatusOr<size_t> AcquireStagingSlot(size_t pool_idx);
+
+  // Returns the host staging buffer currently leased to |pool_idx|, or
+  // kFailedPrecondition if |pool_idx| holds no lease.
+  absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const;
+
  private:
   friend struct ReshardSendSessionTestPeer;
+
+  // Checks the preconditions of ExecutePush that need no waiting: a running
+  // transport server, at least one host staging layer, and every transfer
+  // pool index resolving on |base_|.
+  absl::Status ValidatePushPreconditions() const;
+
+  void ExecutePushPipeline(KVCacheManagerWithTransfer& manager,
+                           std::vector<int64_t> src_block_ids);
 
   ReshardSendSession(kv_cache::KVCacheManagerBase* base,
                      StagingBlockAllocator* staging_allocator,
@@ -153,6 +172,8 @@ class ReshardSendSession
   bool plan_unregistered_ ABSL_GUARDED_BY(mu_) = false;
   // The last op already closed the idle data connections (kPerTransfer).
   bool connections_released_ ABSL_GUARDED_BY(mu_) = false;
+  StagingLayerManager staging_layer_manager_;
+  std::atomic<bool> cancelled_{false};
 };
 
 }  // namespace tpu_raiden

@@ -2686,9 +2686,10 @@ absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::CopyPoolBlocks(
 
 absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::D2hPoolBlocks(
     size_t pool_idx, absl::Span<const int64_t> block_ids,
-    std::optional<size_t> shard_idx, std::optional<uint64_t> uuid) {
+    std::optional<size_t> shard_idx, std::optional<uint64_t> uuid,
+    std::optional<size_t> host_layer_idx) {
   return CopyPoolBlocks(pool_idx, block_ids, shard_idx,
-                        /*device_to_host=*/true, uuid);
+                        /*device_to_host=*/true, uuid, host_layer_idx);
 }
 
 absl::StatusOr<raiden::PjRtCopyFuture> KVCacheManagerBase::H2dPoolBlocks(

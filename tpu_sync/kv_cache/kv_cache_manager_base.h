@@ -705,7 +705,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
   absl::StatusOr<raiden::PjRtCopyFuture> D2hPoolBlocks(
       size_t pool_idx, absl::Span<const int64_t> block_ids,
       std::optional<size_t> shard_idx = std::nullopt,
-      std::optional<uint64_t> uuid = std::nullopt);
+      std::optional<uint64_t> uuid = std::nullopt,
+      std::optional<size_t> host_layer_idx = std::nullopt);
 
   // Inverse of D2hPoolBlocks: host mirror -> device storage.
   absl::StatusOr<raiden::PjRtCopyFuture> H2dPoolBlocks(
