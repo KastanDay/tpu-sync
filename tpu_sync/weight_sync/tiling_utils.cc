@@ -370,7 +370,8 @@ decltype(auto) DispatchByRowBytes(int64_t row_bytes, F&& f) {
 namespace hn = hwy::HWY_NAMESPACE;
 
 // Copies valid_bytes from src to dst and zero-fills the rest of total_row_bytes
-// using portable Highway SIMD vector operations.
+// using portable Highway SIMD vector operations. Never reads past
+// src + valid_bytes or writes past dst + total_row_bytes.
 inline void CopyRowWithPaddingHighway(const uint8_t* src, uint8_t* dst,
                                       size_t valid_bytes,
                                       size_t total_row_bytes) {
@@ -384,13 +385,11 @@ inline void CopyRowWithPaddingHighway(const uint8_t* src, uint8_t* dst,
   }
 
   if (offset < valid_bytes) {
-    const size_t rem = valid_bytes - offset;
-    const auto mask = hn::FirstN(d, rem);
-    const auto v = hn::LoadU(d, src + offset);
-    const auto zeros = hn::Zero(d);
-    const auto blended = hn::IfThenElse(mask, v, zeros);
-    hn::StoreU(blended, d, dst + offset);
-    offset += N;
+    // LoadN zeroes the lanes past the valid tail, which pads the row.
+    const auto v = hn::LoadN(d, src + offset, valid_bytes - offset);
+    const size_t num_stored = std::min(N, total_row_bytes - offset);
+    hn::StoreN(v, d, dst + offset, num_stored);
+    offset += num_stored;
   }
 
   const auto zeros = hn::Zero(d);
@@ -399,12 +398,12 @@ inline void CopyRowWithPaddingHighway(const uint8_t* src, uint8_t* dst,
   }
 
   if (offset < total_row_bytes) {
-    const auto mask = hn::FirstN(d, total_row_bytes - offset);
-    hn::BlendedStore(zeros, mask, d, dst + offset);
+    hn::StoreN(zeros, d, dst + offset, total_row_bytes - offset);
   }
 }
 
-// Detiles valid_bytes from src to dst using Highway SIMD vectors.
+// Detiles valid_bytes from src to dst using Highway SIMD vectors. Never reads
+// past src + valid_bytes or writes past dst + valid_bytes.
 inline void DetileRowWithPaddingHighway(const uint8_t* src, uint8_t* dst,
                                         size_t valid_bytes) {
   const hn::ScalableTag<uint8_t> d;
@@ -417,9 +416,8 @@ inline void DetileRowWithPaddingHighway(const uint8_t* src, uint8_t* dst,
   }
 
   if (offset < valid_bytes) {
-    const auto mask = hn::FirstN(d, valid_bytes - offset);
-    const auto v = hn::LoadU(d, src + offset);
-    hn::BlendedStore(v, mask, d, dst + offset);
+    const size_t rem = valid_bytes - offset;
+    hn::StoreN(hn::LoadN(d, src + offset, rem), d, dst + offset, rem);
   }
 }
 
@@ -433,8 +431,7 @@ inline void ZeroRowHighway(uint8_t* dst, size_t total_row_bytes) {
     hn::StoreU(zeros, d, dst + offset);
   }
   if (offset < total_row_bytes) {
-    const auto mask = hn::FirstN(d, total_row_bytes - offset);
-    hn::BlendedStore(zeros, mask, d, dst + offset);
+    hn::StoreN(zeros, d, dst + offset, total_row_bytes - offset);
   }
 }
 
