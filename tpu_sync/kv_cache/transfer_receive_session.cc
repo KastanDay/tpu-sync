@@ -783,6 +783,16 @@ absl::StatusOr<size_t> TransferReceiveSession::AcquireStagingSlot(
   return slot;
 }
 
+absl::StatusOr<size_t> TransferReceiveSession::LookupStagingSlot(
+    size_t layer_idx) const {
+  std::optional<size_t> slot = staging_layer_manager_.Lookup(layer_idx);
+  if (!slot.has_value()) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("Layer ", layer_idx, " has no leased staging slot"));
+  }
+  return *slot;
+}
+
 absl::Status TransferReceiveSession::ExecuteLayerH2d(
     KVCacheManagerWithTransfer& manager, size_t layer_idx) {
   // Host source of the copy: the layer's own buffer on a full mirror, or its
@@ -790,12 +800,7 @@ absl::Status TransferReceiveSession::ExecuteLayerH2d(
   // when the layer's bytes were addressed in GetBlockChunks).
   size_t host_layer_idx = layer_idx;
   if (base_->num_host_layers() < base_->num_layers()) {
-    std::optional<size_t> slot = staging_layer_manager_.Lookup(layer_idx);
-    if (!slot.has_value()) {
-      return absl::FailedPreconditionError(
-          absl::StrCat("Layer ", layer_idx, " has no leased staging slot"));
-    }
-    host_layer_idx = *slot;
+    ABSL_ASSIGN_OR_RETURN(host_layer_idx, LookupStagingSlot(layer_idx));
   }
   CopySpec copy_spec;
   std::string session_req_id;

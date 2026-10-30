@@ -100,6 +100,17 @@ class TransferSession {
   // Returns true if the session's outcome has been decided and it is draining
   // in-flight operations (or has finished draining).
   virtual bool IsDraining() const = 0;
+
+  // Returns the host staging buffer leased to |unit| (a layer index on the
+  // layer transfer path, a pool index on the pool reshard path), leasing one
+  // when it has none and waiting until the session deadline while every
+  // buffer is leased. Fails with the session's terminal status (or
+  // kCancelled) once the session is draining. Thread-safe.
+  virtual absl::StatusOr<size_t> AcquireStagingSlot(size_t unit) = 0;
+
+  // Returns the host staging buffer currently leased to |unit|, or
+  // kFailedPrecondition when it holds none. Thread-safe.
+  virtual absl::StatusOr<size_t> LookupStagingSlot(size_t unit) const = 0;
 };
 
 }  // namespace tpu_raiden

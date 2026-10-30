@@ -101,13 +101,13 @@ class ReshardSendSession
 
   // Returns the host staging buffer leased to |pool_idx|, leasing one when it
   // has none and waiting until deadline when every slot is leased.
-  absl::StatusOr<size_t> AcquireStagingSlot(size_t pool_idx);
+  absl::StatusOr<size_t> AcquireStagingSlot(size_t pool_idx) override;
 
   // Returns the host staging buffer currently leased to |pool_idx|. Fails
   // with the session's status (or kCancelled) once the session is draining
   // and holds no lease for |pool_idx|, and kFailedPrecondition when a live
   // session holds none.
-  absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const;
+  absl::StatusOr<size_t> LookupStagingSlot(size_t pool_idx) const override;
 
  private:
   friend struct ReshardSendSessionTestPeer;
