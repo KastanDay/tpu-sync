@@ -215,6 +215,8 @@ class HostOffloadBackend : public KVCacheStoreBackend {
   // BackendConfig.kv_pool_group.
   const std::string kv_pool_group_;
   controller::RaidenController* raiden_controller_ = nullptr;
+  // Configured at construction, immutable afterwards.
+  const std::string dp_rank_str_;
 
   std::shared_ptr<global_registry::GlobalRegistryClient> registry_client_
       ABSL_GUARDED_BY(mutex_);
