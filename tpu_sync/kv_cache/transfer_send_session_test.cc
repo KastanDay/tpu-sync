@@ -796,5 +796,61 @@ TEST(TransferSendSessionTest,
   EXPECT_EQ(allocator->num_free_slots(), 2);
 }
 
+// The first layer's D2H dispatch fails, so no copy is ever issued: the
+// dispatch error fails the send, `fail_unissued_layers` resolves layer 0's
+// promise with it, and the H2H chain's own callback on that promise releases
+// the last op. The send settles inside StartPush with nothing in flight.
+TEST(TransferSendSessionTest, FailedD2hDispatchOnFirstLayerSettlesAtOnce) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  base.FailD2hDispatchAtLayer(/*layer_idx=*/0,
+                              absl::InternalError("dispatch refused"));
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
+  const auto now = std::chrono::steady_clock::now();
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_first_dispatch_fail", /*uuid=*/309,
+      /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
+      /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0});
+
+  EXPECT_EQ(base.d2h_calls(), 1);
+  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kInternal));
+  EXPECT_TRUE(session->Done());
+  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(base.h2h_calls(), 0);
+  EXPECT_EQ(allocator->num_free_slots(), 2);
+}
+
+// A send cancelled while its push is in flight keeps the cancellation when
+// the push then fails: FinishLocked is first-Finish-wins, so the push
+// callback's error does not replace the status already decided, and the
+// failed push's op is what settles the send.
+TEST(TransferSendSessionTest, CancelledSendWhosePushThenFailsKeepsCancelled) {
+  FakeSendBase base(/*num_layers=*/1, /*host_blocks=*/4);
+  base.SetManualH2h(true);
+  std::unique_ptr<StagingBlockAllocator> allocator =
+      CreateStagingBlockAllocator(&base, /*num_slots=*/2, /*max_blocks=*/1);
+  const auto now = std::chrono::steady_clock::now();
+  std::shared_ptr<TransferSendSession> session = *TransferSendSession::Create(
+      &base, allocator.get(), "req_cancel_then_push_fail", /*uuid=*/310,
+      /*block_ids=*/{0}, /*deadline=*/now + std::chrono::seconds(10),
+      /*register_start=*/now);
+  session->ValidateAndBeginPull({0}, now);
+  session->StartPush({"127.0.0.1:9000"}, /*src_block_ids=*/{0},
+                     /*dst_block_ids=*/{0});
+  ASSERT_TRUE(base.WaitForH2hCalls(1, absl::Seconds(2)));
+
+  session->Finish(absl::CancelledError("consumer cancelled"));
+  EXPECT_TRUE(session->IsDraining());
+  EXPECT_FALSE(session->Done());
+
+  base.CompleteH2h(0, absl::InternalError("push failed"));
+  EXPECT_THAT(session->AwaitForDone(), StatusIs(absl::StatusCode::kCancelled));
+  EXPECT_FALSE(session->HasStaging());
+  EXPECT_EQ(allocator->num_free_slots(), 2);
+}
+
 }  // namespace
 }  // namespace tpu_raiden
