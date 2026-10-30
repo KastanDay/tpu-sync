@@ -23,9 +23,9 @@
 
 #include "absl/base/thread_annotations.h"
 #include "absl/container/flat_hash_map.h"
-#include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
+#include "tpu_sync/transport/transfer_session.h"  // IWYU pragma: export
 
 namespace tpu_raiden {
 
@@ -72,45 +72,6 @@ class StagingLayerManager {
   std::deque<size_t> free_ ABSL_GUARDED_BY(mu_);
   absl::flat_hash_map<size_t, size_t> leases_ ABSL_GUARDED_BY(mu_);
   bool shutdown_ ABSL_GUARDED_BY(mu_) = false;
-};
-
-// Base interface for producer and consumer KV-cache transfer sessions.
-//
-// Implementations are thread-safe and synchronize session lifecycle state
-// internally.
-class TransferSession {
- public:
-  virtual ~TransferSession() = default;
-
-  // Returns true once the session's outcome has been decided and all in-flight
-  // operations have drained.
-  virtual bool Done() const = 0;
-
-  // Records the session's outcome with |status| and transitions the session
-  // into draining (or marks it done immediately if no operations are in
-  // flight).
-  virtual void Finish(const absl::Status& status = absl::OkStatus()) = 0;
-
-  // Returns the session's status (OkStatus() unless the session has failed).
-  virtual absl::Status GetStatus() const = 0;
-
-  // Blocks until Done() becomes true and returns GetStatus().
-  virtual absl::Status AwaitForDone() = 0;
-
-  // Returns true if the session's outcome has been decided and it is draining
-  // in-flight operations (or has finished draining).
-  virtual bool IsDraining() const = 0;
-
-  // Returns the host staging buffer leased to |unit| (a layer index on the
-  // layer transfer path, a pool index on the pool reshard path), leasing one
-  // when it has none and waiting until the session deadline while every
-  // buffer is leased. Fails with the session's terminal status (or
-  // kCancelled) once the session is draining. Thread-safe.
-  virtual absl::StatusOr<size_t> AcquireStagingSlot(size_t unit) = 0;
-
-  // Returns the host staging buffer currently leased to |unit|, or
-  // kFailedPrecondition when it holds none. Thread-safe.
-  virtual absl::StatusOr<size_t> LookupStagingSlot(size_t unit) const = 0;
 };
 
 }  // namespace tpu_raiden

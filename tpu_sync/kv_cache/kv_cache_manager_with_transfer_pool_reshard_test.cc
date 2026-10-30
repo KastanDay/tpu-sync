@@ -32,10 +32,12 @@
 #include <gtest/gtest.h>
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "absl/types/span.h"
+#include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/kv_cache/pool_layout.h"
 #include "tpu_sync/kv_cache/reshard_receive_session.h"
@@ -43,6 +45,7 @@
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/mock_metrics_backend.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 
@@ -56,6 +59,7 @@ struct PoolReshardRecvTestPeer {
 
 namespace {
 
+using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::testing::_;
 using ::testing::Contains;
@@ -87,6 +91,19 @@ class TestManager : public KVCacheManagerWithTransfer {
       session = it->second;
     }
     PoolReshardRecvTestPeer::FinishPoolH2d(*session, *this, pool_idx, status);
+  }
+  absl::Status AddPoolReshardSend(const StartTransferRequest& plan,
+                                  absl::Span<const int64_t> src_block_ids) {
+    absl::StatusOr<std::shared_ptr<ReshardSendSession>> session =
+        ReshardSendSession::Create(base(), staging_allocator_.get(),
+                                   src_block_ids, /*parallelism=*/1,
+                                   DeadlineFromNow(), plan);
+    if (!session.ok()) {
+      return session.status();
+    }
+    absl::MutexLock lock(mu_);
+    active_pool_reshard_sends_[plan.uuid()] = *std::move(session);
+    return absl::OkStatus();
   }
   using KVCacheManagerWithTransfer::PoolReshardRegisterRecv;
 
@@ -964,6 +981,73 @@ TEST(SubPlanChainTest, SinglePlanRequestsReportAtOnce) {
   manager.FinishPoolReshardRecvPool(5031, /*pool_idx=*/0, absl::OkStatus());
   const auto [sent, received, failed] = manager.CompleteReadRaw();
   EXPECT_THAT(received, Contains("pool_reshard_req_5031"));
+}
+
+TEST(PoolReshardSessionLookupTest,
+     GetSessionResolvesActiveReshardRecvUntilRetired) {
+  TestManager manager;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({DensePool("fa")}));
+  manager.AttachPlaceholderDeviceHold();
+
+  EXPECT_THAT(manager.GetSession(/*uuid=*/8001),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(manager.base()->GetSession(/*uuid=*/8001),
+              StatusIs(absl::StatusCode::kNotFound));
+
+  ABSL_ASSERT_OK(manager.PoolReshardRegisterRecv(ValidPlan(/*uuid=*/8001),
+                                                 std::vector<int64_t>{0}));
+  absl::StatusOr<std::shared_ptr<TransferSession>> recv_session =
+      manager.GetSession(/*uuid=*/8001);
+  ABSL_ASSERT_OK(recv_session);
+  ASSERT_NE(*recv_session, nullptr);
+  EXPECT_FALSE((*recv_session)->Done());
+  EXPECT_THAT(manager.base()->GetSession(/*uuid=*/8001),
+              IsOkAndHolds(*recv_session));
+
+  manager.FinishPoolReshardRecvPool(/*uuid=*/8001, /*pool_idx=*/0,
+                                    absl::OkStatus());
+  {
+    const auto [sent, received, failed] = manager.CompleteReadRaw();
+    EXPECT_THAT(received, Contains("pool_reshard_req_8001"));
+    EXPECT_THAT(failed, IsEmpty());
+  }
+  EXPECT_THAT(manager.GetSession(/*uuid=*/8001),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(manager.base()->GetSession(/*uuid=*/8001),
+              StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST(PoolReshardSessionLookupTest,
+     GetSessionResolvesActiveReshardSendUntilRetired) {
+  TestManager manager;
+  ABSL_ASSERT_OK(manager.base()->RegisterPools({DensePool("fa")}));
+  manager.AttachPlaceholderDeviceHold();
+
+  EXPECT_THAT(manager.GetSession(/*uuid=*/8002),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(manager.base()->GetSession(/*uuid=*/8002),
+              StatusIs(absl::StatusCode::kNotFound));
+
+  ABSL_ASSERT_OK(manager.AddPoolReshardSend(ValidPlan(/*uuid=*/8002),
+                                            std::vector<int64_t>{0}));
+  absl::StatusOr<std::shared_ptr<TransferSession>> send_session =
+      manager.GetSession(/*uuid=*/8002);
+  ABSL_ASSERT_OK(send_session);
+  ASSERT_NE(*send_session, nullptr);
+  EXPECT_FALSE((*send_session)->Done());
+  EXPECT_THAT(manager.base()->GetSession(/*uuid=*/8002),
+              IsOkAndHolds(*send_session));
+
+  (*send_session)->Finish();
+  {
+    const auto [sent, received, failed] = manager.CompleteReadRaw();
+    EXPECT_THAT(sent, Contains("pool_reshard_req_8002"));
+    EXPECT_THAT(failed, IsEmpty());
+  }
+  EXPECT_THAT(manager.GetSession(/*uuid=*/8002),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(manager.base()->GetSession(/*uuid=*/8002),
+              StatusIs(absl::StatusCode::kNotFound));
 }
 
 }  // namespace

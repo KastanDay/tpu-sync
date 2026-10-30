@@ -37,6 +37,7 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/status_matchers.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
@@ -56,11 +57,13 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/telemetry/mock_metrics_backend.h"
 #include "tpu_sync/transport/block_transport.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
 namespace {
 
+using ::absl_testing::IsOkAndHolds;
 using ::absl_testing::StatusIs;
 using ::testing::HasSubstr;
 
@@ -2588,6 +2591,44 @@ TEST(KVCacheManagerTest, NumStagingLayersBoundsHostLayerBuffers) {
   // Validation also runs for an empty cache, which otherwise returns early.
   rig.layer_handles.clear();
   EXPECT_THROW(rig.CreateManager(1), std::invalid_argument);
+}
+
+class StubTransferSession : public TransferSession {
+ public:
+  bool Done() const override { return false; }
+  void Finish(const absl::Status& status) override {}
+  absl::Status GetStatus() const override { return absl::OkStatus(); }
+  absl::Status AwaitForDone() override { return absl::OkStatus(); }
+  bool IsDraining() const override { return false; }
+  absl::StatusOr<size_t> AcquireStagingSlot(size_t unit) override {
+    return size_t{0};
+  }
+  absl::StatusOr<size_t> LookupStagingSlot(size_t unit) const override {
+    return size_t{0};
+  }
+};
+
+TEST(KVCacheManagerTest, GetSessionDefaultsToNotFoundAndDelegatesToHook) {
+  TestKVCacheManager manager(/*num_layers=*/1, /*num_shards=*/1,
+                             /*slice_byte_size=*/128, /*host_blocks=*/1);
+  EXPECT_THAT(manager.GetSession(/*uuid=*/42),
+              StatusIs(absl::StatusCode::kNotFound));
+
+  auto expected_session = std::make_shared<StubTransferSession>();
+  KVCacheManagerBase::TransferEventHooks hooks;
+  hooks.get_session =
+      [expected_session](
+          uint64_t uuid) -> absl::StatusOr<std::shared_ptr<TransferSession>> {
+    if (uuid == 42) {
+      return expected_session;
+    }
+    return absl::NotFoundError(absl::StrCat("Session ", uuid, " not found"));
+  };
+  manager.SetTransferEventHooks(std::move(hooks));
+
+  EXPECT_THAT(manager.GetSession(/*uuid=*/42), IsOkAndHolds(expected_session));
+  EXPECT_THAT(manager.GetSession(/*uuid=*/99),
+              StatusIs(absl::StatusCode::kNotFound));
 }
 
 }  // namespace

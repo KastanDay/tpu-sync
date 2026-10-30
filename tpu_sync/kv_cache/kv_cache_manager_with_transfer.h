@@ -41,6 +41,7 @@
 #include "tpu_sync/core/staging_arena.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_sync {
 namespace rpc {
@@ -261,6 +262,11 @@ class KVCacheManagerWithTransfer {
   // Bound on one control handshake, end to end, in seconds.
   double control_timeout_s() const { return control_timeout_s_; }
 
+  // Returns the active transfer session registered under |uuid|, or kNotFound
+  // when no session holds it. Thread-safe.
+  absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
+      uint64_t uuid) const;
+
  protected:
   KVCacheManagerWithTransfer(
       std::unique_ptr<kv_cache::KVCacheManagerBase> base, int64_t node_id = 0,
@@ -379,7 +385,7 @@ class KVCacheManagerWithTransfer {
   // Fails stalled sub-plan chains and expires reported ones.
   void SweepSubPlanChainsLocked(std::chrono::steady_clock::time_point now)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
-  absl::Mutex mu_;
+  mutable absl::Mutex mu_;
   absl::CondVar cv_;
   std::atomic<bool> stopping_{false};
   std::unique_ptr<ControlPlaneHandler> control_handler_;

@@ -41,6 +41,7 @@
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/buffer_push_task.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 
@@ -220,6 +221,11 @@ class RaidenManagerBase : public tpu_raiden::transport::BlockTransportDelegate {
 
   int GetRemoteReadBlockId(int base_remote_id, int chunk_k) override {
     return base_remote_id + chunk_k;
+  }
+
+  absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
+      uint64_t uuid) const override {
+    return absl::UnimplementedError("Transfer sessions are not available");
   }
 
   absl::Status OnLayerDataReceived(size_t layer_idx,

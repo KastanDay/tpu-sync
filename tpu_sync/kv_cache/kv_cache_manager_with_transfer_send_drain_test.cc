@@ -58,10 +58,13 @@
 #include "tpu_sync/kv_cache/transfer_send_session.h"
 #include "tpu_sync/kv_cache/transfer_session.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace {
 
+using ::absl_testing::IsOkAndHolds;
+using ::absl_testing::StatusIs;
 using ::testing::_;
 using ::testing::AllOf;
 using ::testing::Contains;
@@ -1724,5 +1727,62 @@ TEST(SendLifecycleTest,
   EXPECT_EQ(producer.free_slots(), kSlots);
   EXPECT_FALSE(producer.has_send(404));
 }
+
+TEST(SendLifecycleTest,
+     GetSessionResolvesActiveSendAndReturnsNotFoundAfterRetirement) {
+  TestManager producer(/*num_layers=*/1);
+  EXPECT_THAT(producer.GetSession(/*uuid=*/501),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(producer.base()->GetSession(/*uuid=*/501),
+              StatusIs(absl::StatusCode::kNotFound));
+
+  ASSERT_GT(producer.NotifyForRead("req_get_send", /*uuid=*/501,
+                                   /*block_ids=*/{0}),
+            0);
+
+  absl::StatusOr<std::shared_ptr<TransferSession>> session =
+      producer.GetSession(/*uuid=*/501);
+  ABSL_ASSERT_OK(session);
+  ASSERT_NE(*session, nullptr);
+  EXPECT_FALSE((*session)->Done());
+  EXPECT_THAT(producer.base()->GetSession(/*uuid=*/501),
+              IsOkAndHolds(*session));
+
+  producer.CancelSend(501);
+  Reports reports = producer.CompleteReadRaw();
+  EXPECT_THAT(FailedRecving(reports), Contains("req_get_send"));
+  EXPECT_THAT(producer.GetSession(/*uuid=*/501),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(producer.base()->GetSession(/*uuid=*/501),
+              StatusIs(absl::StatusCode::kNotFound));
+}
+
+TEST(RecvLifecycleTest,
+     GetSessionResolvesActiveRecvAndReturnsNotFoundAfterRetirement) {
+  RecvTestManager consumer(/*num_layers=*/1);
+  EXPECT_THAT(consumer.GetSession(/*uuid=*/502),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(consumer.base()->GetSession(/*uuid=*/502),
+              StatusIs(absl::StatusCode::kNotFound));
+
+  consumer.AddRecv("req_get_recv", /*uuid=*/502);
+
+  absl::StatusOr<std::shared_ptr<TransferSession>> session =
+      consumer.GetSession(/*uuid=*/502);
+  ABSL_ASSERT_OK(session);
+  ASSERT_NE(*session, nullptr);
+  EXPECT_FALSE((*session)->Done());
+  EXPECT_THAT(consumer.base()->GetSession(/*uuid=*/502),
+              IsOkAndHolds(*session));
+
+  consumer.FailRecv(502, absl::CancelledError("done"));
+  Reports reports = consumer.CompleteReadRaw();
+  EXPECT_THAT(FailedRecving(reports), Contains("req_get_recv"));
+  EXPECT_THAT(consumer.GetSession(/*uuid=*/502),
+              StatusIs(absl::StatusCode::kNotFound));
+  EXPECT_THAT(consumer.base()->GetSession(/*uuid=*/502),
+              StatusIs(absl::StatusCode::kNotFound));
+}
+
 }  // namespace
 }  // namespace tpu_raiden

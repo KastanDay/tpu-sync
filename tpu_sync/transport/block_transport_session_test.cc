@@ -30,6 +30,7 @@
 #include "absl/types/span.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
 #include "tpu_sync/transport/lib/chunk.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -101,6 +102,11 @@ class MockSessionDelegate : public BlockTransportDelegate {
 
   int GetRemoteReadBlockId(int base_remote_id, int chunk_k) override {
     return base_remote_id + chunk_k;
+  }
+
+  absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
+      uint64_t uuid) const override {
+    return absl::NotFoundError("Session not found");
   }
 
   uint8_t* GetBlockArrayHostPointer(size_t layer, size_t shard) override {

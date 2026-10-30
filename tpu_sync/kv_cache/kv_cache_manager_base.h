@@ -49,6 +49,7 @@
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 
@@ -199,6 +200,11 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     // |layer_idx|, or an error if |layer_idx| holds no lease.
     std::function<absl::StatusOr<size_t>(uint64_t uuid, size_t layer_idx)>
         lookup_send_staging;
+    // Returns the active transfer session registered under |uuid|, or
+    // kNotFound when no session holds it.
+    std::function<absl::StatusOr<std::shared_ptr<TransferSession>>(
+        uint64_t uuid)>
+        get_session;
   };
 
   void SetTransferEventHooks(TransferEventHooks hooks) {
@@ -721,6 +727,8 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
       uint64_t uuid, const absl::Status& status = absl::OkStatus()) override;
   absl::Status OnRecvProgress(uint64_t uuid) override;
   absl::Status OnRecvNetworkComplete(uint64_t uuid) override;
+  absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
+      uint64_t uuid) const override;
 
   absl::StatusOr<std::optional<tpu_raiden::transport::PoolPushProgressSpec>>
   GetPoolPushProgressSpec(size_t pool_idx, uint64_t uuid) const override;

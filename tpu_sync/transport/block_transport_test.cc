@@ -67,6 +67,7 @@
 #include "tpu_sync/transport/lib/chunk_serializer.h"
 #include "tpu_sync/transport/lib/psp/psp_syscall_mock.h"  // NOLINT
 #include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -246,6 +247,11 @@ class MockDelegate : public BlockTransportDelegate {
 
   int GetRemoteReadBlockId(int base_remote_id, int chunk_k) override {
     return base_remote_id + chunk_k;
+  }
+
+  absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
+      uint64_t uuid) const override {
+    return absl::NotFoundError("Session not found");
   }
 
   size_t num_layers() const override { return num_layers_; }

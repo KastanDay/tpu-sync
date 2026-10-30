@@ -506,7 +506,29 @@ void KVCacheManagerWithTransfer::InitializeBaseHooks() {
     }
     return reshard_session->LookupStagingSlot(layer_idx);
   };
+  hooks.get_session = [this](uint64_t uuid) { return GetSession(uuid); };
   base_->SetTransferEventHooks(std::move(hooks));
+}
+
+absl::StatusOr<std::shared_ptr<TransferSession>>
+KVCacheManagerWithTransfer::GetSession(uint64_t uuid) const {
+  absl::MutexLock lock(mu_);
+  if (auto it = send_sessions_.find(uuid); it != send_sessions_.end()) {
+    return it->second;
+  }
+  if (auto it = active_recv_sessions_.find(uuid);
+      it != active_recv_sessions_.end()) {
+    return it->second;
+  }
+  if (auto it = active_pool_reshard_sends_.find(uuid);
+      it != active_pool_reshard_sends_.end()) {
+    return it->second;
+  }
+  if (auto it = active_pool_reshard_recvs_.find(uuid);
+      it != active_pool_reshard_recvs_.end()) {
+    return it->second;
+  }
+  return absl::NotFoundError(absl::StrCat("Session ", uuid, " not found"));
 }
 
 KVCacheManagerWithTransfer::KVCacheManagerWithTransfer(

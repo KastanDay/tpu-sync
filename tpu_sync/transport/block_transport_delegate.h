@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <thread>  // NOLINT
 #include <utility>
@@ -29,6 +30,7 @@
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace transport {
@@ -229,8 +231,12 @@ class BlockTransportDelegate : public lib::RawBufferTransportDelegate {
     return base + static_cast<size_t>(block_id) * block_bytes(layer_idx);
   }
 
-
   virtual int GetRemoteReadBlockId(int base_remote_id, int chunk_k) = 0;
+
+  // Returns the active transfer session registered under |uuid|, or kNotFound
+  // when no session holds it.
+  virtual absl::StatusOr<std::shared_ptr<TransferSession>> GetSession(
+      uint64_t uuid) const = 0;
 
   virtual size_t num_layers() const = 0;
   virtual size_t num_shards() const = 0;

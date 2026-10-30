@@ -19,10 +19,21 @@ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "transfer_session",
+    hdrs = ["transfer_session.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+    ],
+)
+
+cc_library(
     name = "block_transport_delegate",
     hdrs = ["block_transport_delegate.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":transfer_session",
         "//tpu_sync/transport/lib:raw_buffer_transport_delegate",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
@@ -129,6 +140,7 @@ cc_test(
         ":block_transport",
         ":block_transport_delegate",
         ":buffer_push_task",
+        ":transfer_session",
         "//tpu_sync/telemetry:metrics_3p_prometheus_exporter",
         "//tpu_sync/telemetry:metrics_api",
         "//tpu_sync/telemetry:metrics_backend",
@@ -169,6 +181,7 @@ cc_test(
     deps = [
         ":block_transport_delegate",
         ":block_transport_session",
+        ":transfer_session",
         "//tpu_sync/transport/lib:chunk",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:status_matchers",

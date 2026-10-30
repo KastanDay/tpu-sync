@@ -74,6 +74,7 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/block_transport.h"
 #include "tpu_sync/transport/block_transport_delegate.h"
+#include "tpu_sync/transport/transfer_session.h"
 
 namespace tpu_raiden {
 namespace kv_cache {
@@ -2729,6 +2730,13 @@ absl::Status KVCacheManagerBase::OnRecvNetworkComplete(uint64_t uuid) {
   return transfer_hooks_.on_recv_network_complete
              ? transfer_hooks_.on_recv_network_complete(uuid)
              : absl::OkStatus();
+}
+
+absl::StatusOr<std::shared_ptr<TransferSession>> KVCacheManagerBase::GetSession(
+    uint64_t uuid) const {
+  return transfer_hooks_.get_session ? transfer_hooks_.get_session(uuid)
+                                     : absl::NotFoundError(absl::StrCat(
+                                           "Session ", uuid, " not found"));
 }
 
 absl::StatusOr<std::optional<tpu_raiden::transport::PoolPushProgressSpec>>
