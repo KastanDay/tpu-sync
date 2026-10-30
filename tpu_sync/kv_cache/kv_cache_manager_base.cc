@@ -3240,11 +3240,20 @@ absl::Status KVCacheManagerBase::RegisterActivePlan(
       }
     }
   }
+  auto plan_ptr = std::make_shared<RegisteredPlan>(
+      RegisteredPlan{request, is_sender, std::move(host_block_of),
+                     std::move(staged_device_blocks), generation});
+  for (const auto& [src_shard, schedule] :
+       plan_ptr->request.shard_push_schedules()) {
+    auto& block_map = plan_ptr->schedule_by_block[src_shard];
+    for (const auto& entry : schedule.entries()) {
+      block_map[is_sender ? entry.src_block_id() : entry.dst_block_id()]
+          .push_back(&entry);
+    }
+  }
   absl::MutexLock l(plans_mu_);
-  if (auto [it, inserted] = active_plans_.try_emplace(
-          uuid, std::make_shared<const RegisteredPlan>(RegisteredPlan{
-                    request, is_sender, std::move(host_block_of),
-                    std::move(staged_device_blocks), generation}));
+  if (auto [it, inserted] =
+          active_plans_.try_emplace(uuid, std::move(plan_ptr));
       !inserted) {
     return absl::AlreadyExistsError(
         absl::StrCat("Plan with UUID ", uuid, " is already registered!"));
@@ -3476,10 +3485,20 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
   }
 
   const auto& request = plan_snapshot->request;
-  const auto& schedules = request.shard_push_schedules();
-  auto schedule_it = schedules.find(static_cast<int32_t>(shard_idx));
-
+  const auto& schedules = plan_snapshot->schedule_by_block;
   bool is_sender = plan_snapshot->is_sender;
+  const int32_t fixed_src_shard = is_sender
+                                      ? static_cast<int32_t>(shard_idx)
+                                      : static_cast<int32_t>(sender_node_id);
+  auto schedule_it =
+      fixed_src_shard != -1 ? schedules.find(fixed_src_shard) : schedules.end();
+  const auto block_entries = [](const RegisteredPlan::BlockEntryMap& block_map,
+                                int64_t block_id)
+      -> absl::Span<const ::tpu_sync::rpc::ShardPushEntryProto* const> {
+    auto it = block_map.find(block_id);
+    if (it == block_map.end()) return {};
+    return it->second;
+  };
 
   // Pool reshard plans scope every entry to one pool group; an entry only
   // resolves chunks for pools of its own group. Only LEGACY (non-pool)
@@ -3506,6 +3525,7 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
   }
 
   std::vector<tpu_raiden::transport::BlockChunk> chunks;
+  std::vector<tpu_raiden::transport::BlockChunk> block_resolved_chunks;
   size_t accumulated_bytes = 0;
 
   for (int64_t block_id : block_ids) {
@@ -3527,12 +3547,14 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
       // Bounded storage: this uuid's lease does not cover the block.
       return {};
     }
-    std::vector<tpu_raiden::transport::BlockChunk> block_resolved_chunks;
+    block_resolved_chunks.clear();
 
     if (is_sender) {
       if (schedule_it != schedules.end()) {
         const auto& schedule = schedule_it->second;
-        for (const auto& entry : schedule.entries()) {
+        for (const ::tpu_sync::rpc::ShardPushEntryProto* entry_ptr :
+             block_entries(schedule, block_id)) {
+          const ::tpu_sync::rpc::ShardPushEntryProto& entry = *entry_ptr;
           if (!entry_targets_pool(entry)) {
             continue;
           }
@@ -3573,7 +3595,9 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
         // (merging) where multiple source blocks target the same dst_block_id.
         // If src_block_id is -1, we fall back to matching only on dst_block_id.
         for (const auto& [src_shard, src_schedule] : schedules) {
-          for (const auto& entry : src_schedule.entries()) {
+          for (const ::tpu_sync::rpc::ShardPushEntryProto* entry_ptr :
+               block_entries(src_schedule, block_id)) {
+            const ::tpu_sync::rpc::ShardPushEntryProto& entry = *entry_ptr;
             if (entry_targets_pool(entry) &&
                 static_cast<size_t>(entry.dst_shard_idx()) == shard_idx &&
                 static_cast<size_t>(entry.dst_block_id()) == block_id &&
@@ -3588,10 +3612,14 @@ KVCacheManagerBase::GetBlockChunks(size_t layer_idx, size_t shard_idx,
       }
 
       if (found_src_shard != -1) {
-        auto schedule_found_it = schedules.find(found_src_shard);
+        auto schedule_found_it = sender_node_id != -1
+                                     ? schedule_it
+                                     : schedules.find(found_src_shard);
         if (schedule_found_it != schedules.end()) {
           const auto& schedule = schedule_found_it->second;
-          for (const auto& entry : schedule.entries()) {
+          for (const ::tpu_sync::rpc::ShardPushEntryProto* entry_ptr :
+               block_entries(schedule, block_id)) {
+            const ::tpu_sync::rpc::ShardPushEntryProto& entry = *entry_ptr;
             if (!entry_targets_pool(entry)) {
               continue;
             }

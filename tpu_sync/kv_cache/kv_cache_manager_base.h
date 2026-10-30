@@ -1048,6 +1048,9 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
 
   mutable absl::Mutex plans_mu_;
   struct RegisteredPlan {
+    using EntryList = std::vector<const ::tpu_sync::rpc::ShardPushEntryProto*>;
+    using BlockEntryMap = absl::flat_hash_map<int64_t, EntryList>;
+
     ::tpu_sync::rpc::StartTransferRequest request;
     bool is_sender = false;
     // Host block holding each device block the plan names on this side
@@ -1063,6 +1066,9 @@ class KVCacheManagerBase : public tpu_raiden::RaidenManagerBase {
     // registration cannot touch a newer one under the same uuid. 0 when
     // the caller keeps no generations; cleanup then matches by uuid alone.
     uint64_t generation = 0;
+    // Per-source-shard schedule entries indexed by src_block_id (sender) or
+    // dst_block_id (receiver). Pointers alias `request.shard_push_schedules()`.
+    absl::flat_hash_map<int32_t, BlockEntryMap> schedule_by_block;
   };
   // Plans are stored behind shared_ptr so the per-push readers
   // (GetBlockChunks / GetPoolPushProgressSpec) snapshot with a refcount bump

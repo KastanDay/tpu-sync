@@ -604,6 +604,91 @@ TEST(PoolStagingTest, BoundedHostLayersPoolStaging) {
   manager.ReleasePoolStagingLeases(42);
 }
 
+TEST(PoolStagingTest, GetBlockChunksLargePlanLinearScaling) {
+  constexpr size_t kNumShards = 8;
+  constexpr size_t kNumFaPools = 6;
+  constexpr size_t kTotalPools = 93;
+  constexpr int64_t kStride = 64;
+  constexpr int64_t kMaxBlocks = 4096;
+  constexpr int64_t kNumBlocks = 3072;
+  constexpr uint64_t kUuid = 101;
+  constexpr char kPeer[] = "127.0.0.1:1";
+
+  StagingTestManager receiver(1, kNumShards, kStride, /*host_blocks=*/1);
+  StagingTestManager sender(1, kNumShards, kStride, /*host_blocks=*/1);
+  const size_t storage_bytes = kTotalPools * kStride * kMaxBlocks;
+  receiver.SetDeviceBacked(0, storage_bytes);
+  sender.SetDeviceBacked(0, storage_bytes);
+
+  std::vector<PoolSpec> specs;
+  specs.reserve(kTotalPools);
+  for (size_t pool_idx = 0; pool_idx < kTotalPools; ++pool_idx) {
+    specs.push_back(DensePool("pool_" + std::to_string(pool_idx), 0,
+                              pool_idx * kStride * kMaxBlocks, kStride,
+                              kMaxBlocks, /*staging_blocks_per_request=*/0));
+  }
+  ABSL_ASSERT_OK(receiver.RegisterPools(specs, /*staging_leases=*/0));
+  ABSL_ASSERT_OK(sender.RegisterPools(specs, /*staging_leases=*/0));
+
+  tpu_sync::rpc::StartTransferRequest request;
+  request.set_uuid(kUuid);
+  request.set_req_id("req");
+  tpu_sync::rpc::PoolGroupProto* fa_group = request.add_pool_groups();
+  tpu_sync::rpc::PoolGroupProto* swa_group = request.add_pool_groups();
+  fa_group->set_expected_pushes(1);
+  swa_group->set_expected_pushes(1);
+  for (size_t pool_idx = 0; pool_idx < kTotalPools; ++pool_idx) {
+    request.add_transfer_pool_indices(pool_idx);
+    (pool_idx < kNumFaPools ? fa_group : swa_group)->add_pool_indices(pool_idx);
+  }
+
+  std::vector<int64_t> dst_blocks(kNumBlocks);
+  for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+    tpu_sync::rpc::ShardPushScheduleProto& schedule =
+        (*request.mutable_shard_push_schedules())[shard_idx];
+    for (int64_t block_id = 0; block_id < kNumBlocks; ++block_id) {
+      dst_blocks[block_id] = block_id + 100;
+      tpu_sync::rpc::ShardPushEntryProto* entry = schedule.add_entries();
+      entry->set_dst_peer(kPeer);
+      entry->set_dst_shard_idx(shard_idx);
+      entry->set_src_block_id(block_id);
+      entry->set_dst_block_id(dst_blocks[block_id]);
+      entry->set_size_bytes(kStride);
+      entry->set_pool_group(0);
+    }
+  }
+  ABSL_ASSERT_OK(
+      receiver.RegisterActivePlan(kUuid, request, /*is_sender=*/false));
+  for (size_t pool_idx = 0; pool_idx < kNumFaPools; ++pool_idx) {
+    TF_ASSERT_OK_AND_ASSIGN(tpu_sync::rpc::PoolHostAddrsProto pool_addrs,
+                            receiver.PoolHostBaseAddrs(kUuid, pool_idx));
+    (*(*request.mutable_receiver_addrs())[kPeer].mutable_pools())[pool_idx] =
+        pool_addrs;
+  }
+  ABSL_ASSERT_OK(sender.RegisterActivePlan(kUuid, request, /*is_sender=*/true));
+
+  for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+    for (size_t pool_idx = 0; pool_idx < kNumFaPools; ++pool_idx) {
+      std::vector<transport::BlockChunk> recv_chunks = receiver.GetBlockChunks(
+          pool_idx, shard_idx, dst_blocks, kNumBlocks * kStride, kUuid,
+          /*sender_node_id=*/shard_idx);
+      ASSERT_EQ(recv_chunks.size(), static_cast<size_t>(kNumBlocks));
+      for (int64_t block_id = 0; block_id < kNumBlocks; ++block_id) {
+        std::vector<transport::BlockChunk> send_chunks = sender.GetBlockChunks(
+            pool_idx, shard_idx, {block_id}, kStride, kUuid,
+            /*sender_node_id=*/-1, kPeer, block_id, dst_blocks[block_id]);
+        ASSERT_EQ(send_chunks.size(), 1u);
+        EXPECT_EQ(send_chunks[0].raddr, recv_chunks[block_id].ptr);
+      }
+    }
+  }
+  EXPECT_TRUE(receiver
+                  .GetBlockChunks(kNumFaPools, /*shard_idx=*/0, dst_blocks,
+                                  kNumBlocks * kStride, kUuid,
+                                  /*sender_node_id=*/0)
+                  .empty());
+}
+
 }  // namespace
 }  // namespace kv_cache
 }  // namespace tpu_raiden
